@@ -17,6 +17,8 @@ parameters:
   cutoffs: [15.0, 25.0]            # Angstroms (converted to Bohr internally)
   warmup_runs: 10
   timing_runs: 20
+  max_total_atoms: 131072
+  cutoff_limits: {}
 
   # cutoff_limits intentionally left empty: OOM thresholds are
   # hardware-specific (we saw 25 Å D3 OOM at total ≥ 128 k on a
@@ -37,6 +39,14 @@ dftd3_parameters:
 
 # D3 reference parameters file (auto-downloaded on first use)
 params_path: ~/.cache/nvalchemiops/dftd3_parameters.pt
+
+# -----------------------------------------------------------------------------
+# Methods
+# -----------------------------------------------------------------------------
+methods:
+  - name: dftd3
+    enabled: true
+    description: "DFT-D3 dispersion energy"
 
 # -----------------------------------------------------------------------------
 # Systems

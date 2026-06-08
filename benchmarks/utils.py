@@ -1,5 +1,18 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2025 - 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 """Benchmark timing, memory measurement, and utility functions.
 
 Timing: batched mean across N back-to-back calls with synchronisation only
@@ -18,6 +31,7 @@ from __future__ import annotations
 
 import csv
 import gc
+import math
 import os
 from collections.abc import Callable
 from datetime import datetime
@@ -30,6 +44,8 @@ import warp as wp
 __all__ = [
     "MemInfo",
     "build_result",
+    "build_failure_result",
+    "build_skipped_result",
     "clean_gpu",
     "create_run_directory",
     "cuda_timed_batch",
@@ -46,6 +62,7 @@ __all__ = [
     "measure_memory_jax",
     "measure_memory_torch",
     "save_results",
+    "sync_gpu",
     "write_run_log",
 ]
 
@@ -56,10 +73,9 @@ class MemInfo(TypedDict):
 
     The two keys map directly to CSV columns. For torch, ``mem_delta_mb``
     is the delta from the pre-timing measurement call and
-    ``mem_peak_gb`` is the allocator peak. For JAX, both are always
-    0.0 — the XLA pool (BFC or platform) makes per-call memory
-    attribution unreliable, so the suite does not track JAX memory.
-    The plotter filters zero-valued JAX rows out of memory panels.
+    ``mem_peak_gb`` is the allocator peak. For JAX, both are ``NaN`` —
+    the XLA pool (BFC or platform) makes per-call memory attribution
+    unreliable, so the suite does not track JAX memory.
     """
 
     mem_delta_mb: float
@@ -87,12 +103,17 @@ def clean_gpu() -> None:
 
     Call once per atom-size change, NOT per (method, cutoff) config.
     """
-    torch.cuda.synchronize()
-    wp.synchronize()
+    sync_gpu()
     gc.collect()
     torch.cuda.empty_cache()
     torch.cuda.reset_peak_memory_stats()
+    sync_gpu()
+
+
+def sync_gpu() -> None:
+    """Synchronize Torch CUDA and Warp work queues once."""
     torch.cuda.synchronize()
+    wp.synchronize()
 
 
 def get_gpu_memory_info() -> dict:
@@ -162,6 +183,7 @@ def lazy_import_jax(
         # and both share the same Python process. Setting the env var
         # unconditionally here is safe — runners that don't need f64
         # still work correctly; only EL relies on it.
+        os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
         if need_electrostatics:
             os.environ.setdefault("JAX_ENABLE_X64", "1")
 
@@ -174,6 +196,8 @@ def lazy_import_jax(
         from nvalchemiops.jax.neighbors import (
             compute_naive_num_shifts,
             estimate_batch_cell_list_sizes,
+        )
+        from nvalchemiops.jax.neighbors import (
             neighbor_list as jax_neighbor_list,
         )
 
@@ -191,16 +215,22 @@ def lazy_import_jax(
             from nvalchemiops.jax.interactions.electrostatics import (
                 estimate_ewald_parameters,
                 estimate_pme_parameters,
+                ewald_real_space,
+                ewald_reciprocal_space,
                 ewald_summation,
                 generate_k_vectors_ewald_summation,
                 generate_k_vectors_pme,
                 particle_mesh_ewald,
+                pme_reciprocal_space,
             )
 
             api.update(
                 {
                     "ewald_summation": ewald_summation,
+                    "ewald_real_space": ewald_real_space,
+                    "ewald_reciprocal_space": ewald_reciprocal_space,
                     "particle_mesh_ewald": particle_mesh_ewald,
+                    "pme_reciprocal_space": pme_reciprocal_space,
                     "generate_k_vectors_pme": generate_k_vectors_pme,
                     "generate_k_vectors_ewald_summation": generate_k_vectors_ewald_summation,
                     "estimate_pme_parameters": estimate_pme_parameters,
@@ -314,12 +344,8 @@ def cuda_timed_batch(
     # Warmup (separate from timing)
     for _ in range(warmup_runs):
         fn()
-    torch.cuda.synchronize()
-    wp.synchronize()
-
-    # Batch timing: sync only at start and end
-    torch.cuda.synchronize()
-    wp.synchronize()
+    # Batch timing: sync only once before start and once after end.
+    sync_gpu()
 
     start = torch.cuda.Event(enable_timing=True)
     end = torch.cuda.Event(enable_timing=True)
@@ -329,8 +355,7 @@ def cuda_timed_batch(
         fn()  # NO sync inside loop
     end.record()
 
-    torch.cuda.synchronize()
-    wp.synchronize()
+    sync_gpu()
 
     elapsed_ms = start.elapsed_time(end)
     return (elapsed_ms / 1000.0) / num_runs  # seconds per run
@@ -449,8 +474,7 @@ def measure_memory_torch(fn: Callable[[], Any]) -> tuple[Any, MemInfo]:
     torch.cuda.reset_peak_memory_stats()
     mem_before = torch.cuda.memory_allocated()
     result = fn()
-    torch.cuda.synchronize()
-    wp.synchronize()
+    sync_gpu()
     mem_peak = torch.cuda.max_memory_allocated()
     mem_info: MemInfo = {
         "mem_delta_mb": (mem_peak - mem_before) / 1024**2,
@@ -460,7 +484,7 @@ def measure_memory_torch(fn: Callable[[], Any]) -> tuple[Any, MemInfo]:
 
 
 def measure_memory_jax(fn: Callable[[], Any], jax_module: Any) -> tuple[Any, MemInfo]:
-    """Run ``fn`` once and return zero memory info.
+    """Run ``fn`` once and return unavailable memory info.
 
     JAX memory is not tracked by this suite. XLA's BFC pool preallocates
     a large fraction of VRAM at process start and reuses across calls,
@@ -481,11 +505,11 @@ def measure_memory_jax(fn: Callable[[], Any], jax_module: Any) -> tuple[Any, Mem
     Returns
     -------
     (result, mem_info)
-        ``mem_info`` is always ``{"mem_delta_mb": 0.0, "mem_peak_gb": 0.0}``.
+        ``mem_info`` is always ``{"mem_delta_mb": NaN, "mem_peak_gb": NaN}``.
     """
     result = fn()
     jax_module.block_until_ready(result)
-    return result, {"mem_delta_mb": 0.0, "mem_peak_gb": 0.0}
+    return result, {"mem_delta_mb": math.nan, "mem_peak_gb": math.nan}
 
 
 # =============================================================================
@@ -580,6 +604,40 @@ def build_result(
     return result
 
 
+def build_failure_result(
+    *,
+    error: str,
+    error_type: str,
+    mem_info: MemInfo | None = None,
+    **kwargs: Any,
+) -> dict:
+    """Build a standardized failed benchmark row."""
+    if mem_info is None:
+        mem_info = {"mem_delta_mb": math.nan, "mem_peak_gb": math.nan}
+    return build_result(
+        time_seconds=0.0,
+        mem_info=mem_info,
+        success=False,
+        error=error,
+        error_type=error_type,
+        **kwargs,
+    )
+
+
+def build_skipped_result(
+    *,
+    reason: str,
+    policy: str = "SkippedByPolicy",
+    **kwargs: Any,
+) -> dict:
+    """Build a standardized row for a planned case skipped before allocation."""
+    return build_failure_result(
+        error=reason,
+        error_type=policy,
+        **kwargs,
+    )
+
+
 def save_results(results: list[dict], output_path: Path | str) -> None:
     """Save benchmark results to CSV.
 
@@ -602,7 +660,11 @@ def save_results(results: list[dict], output_path: Path | str) -> None:
         print(f"No results to save to {output_path}")
         return
 
-    fieldnames = list(results[0].keys())
+    fieldnames = []
+    for result in results:
+        for key in result:
+            if key not in fieldnames:
+                fieldnames.append(key)
 
     # Append if existing file has same schema, else overwrite fresh
     if output_path.exists():

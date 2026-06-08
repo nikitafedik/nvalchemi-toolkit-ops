@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import math
 from collections import defaultdict
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -81,6 +82,7 @@ __all__ = [
     "plot_module",
     "plot_single_panel",
     "render_d3_panel",
+    "render_dyn_panel",
     "render_el_panel",
     "render_nl_panel",
     # Constants
@@ -208,6 +210,8 @@ def load_csv(filepath: str | Path) -> list[dict[str, Any]]:
                     val = row[key]
                     if val in ("True", "False"):
                         row[key] = val == "True"
+                    elif val.lower() in {"nan", "inf", "+inf", "-inf"}:
+                        row[key] = float(val)
                     elif "." in val or "e" in val.lower():
                         row[key] = float(val)
                     elif val.lstrip("-").isdigit():
@@ -242,19 +246,62 @@ def _plot_3panel(
     setup_plot_style()
     fig, axes = plt.subplots(1, 3, figsize=THREE_PANEL_SIZE)
 
-    renderer = {"nl": render_nl_panel, "d3": render_d3_panel, "el": render_el_panel}[
-        module
-    ]
+    renderer = {
+        "nl": render_nl_panel,
+        "d3": render_d3_panel,
+        "el": render_el_panel,
+        "dyn": render_dyn_panel,
+    }[module]
 
     for ax, panel in zip(axes, ("time", "throughput", "memory")):
         renderer(ax, data, system_name, mode, panel)
         # Single-panel renderers set full titles; for 3-panel, use short sub-titles
-        panel_titles = {
-            "time": "Time per Atom",
-            "throughput": "Throughput",
-            "memory": "Peak Memory (VRAM)",
-        }
+        if module == "dyn":
+            panel_titles = {
+                "time": "Time per Atom-Step",
+                "throughput": "Atom-Step Throughput",
+                "memory": "Peak Memory (VRAM)",
+            }
+        else:
+            panel_titles = {
+                "time": "Time per Atom",
+                "throughput": "Throughput",
+                "memory": "Peak Memory (VRAM)",
+            }
         ax.set_title(panel_titles[panel], fontsize=TITLE_SIZE)
+
+    legend_bottom = 0.0
+    if module == "dyn":
+        handles, labels = axes[0].get_legend_handles_labels()
+        for ax in axes:
+            legend = ax.get_legend()
+            if legend is not None:
+                legend.remove()
+        if handles:
+            if len(labels) > 12:
+                legend_bottom = 0.24
+                fig.legend(
+                    handles,
+                    labels,
+                    loc="lower center",
+                    bbox_to_anchor=(0.5, 0.0),
+                    ncol=min(6, max(1, len(labels) // 4)),
+                    frameon=True,
+                    fancybox=True,
+                    framealpha=0.9,
+                    fontsize=7,
+                )
+            else:
+                axes[2].legend(
+                    handles,
+                    labels,
+                    loc="lower center",
+                    bbox_to_anchor=(0.5, 0.0),
+                    frameon=True,
+                    fancybox=True,
+                    framealpha=0.9,
+                    fontsize=9,
+                )
 
     # Suptitle from the first panel's title (renderer sets it, we override)
     mode_str = _build_mode_title(mode, data=data, module=module)
@@ -264,7 +311,10 @@ def _plot_3panel(
         y=1.02,
     )
 
-    plt.tight_layout()
+    if legend_bottom:
+        plt.tight_layout(rect=(0.0, legend_bottom, 1.0, 1.0))
+    else:
+        plt.tight_layout()
     output_path = Path(output_dir) / fname
     plt.savefig(output_path, dpi=150, bbox_inches="tight")
     plt.close()
@@ -286,7 +336,7 @@ def plot_module(
     module: str,
     output_dir: str | Path,
 ) -> Path:
-    """Generic 3-panel plot for any module (nl, d3, el)."""
+    """Generic 3-panel plot for any module (nl, d3, el, dyn)."""
     fname = f"{module}-{system_name}-{MODE_FNAMES.get(mode_name, mode_name)}.png"
     return _plot_3panel(data, system_name, mode_name, module, output_dir, fname)
 
@@ -348,6 +398,8 @@ def plot_single_panel(
         render_d3_panel(ax, data, system, mode, panel)
     elif module == "el":
         render_el_panel(ax, data, system, mode, panel)
+    elif module == "dyn":
+        render_dyn_panel(ax, data, system, mode, panel)
     else:
         print(f"  Unknown module for {name}")
         plt.close()
@@ -368,6 +420,8 @@ def detect_module_mode(name: str) -> tuple[str | None, str | None]:
         module = "d3"
     elif name.startswith(("el_", "el-")):
         module = "el"
+    elif name.startswith(("dyn_", "dyn-")):
+        module = "dyn"
     else:
         return None, None
 
@@ -398,8 +452,8 @@ def _setup_panel_axes(
     NOTE: does NOT call setup_log2_xaxis -- renderers handle x-axis
     themselves (with mode-specific show_batch_size etc).
     """
-    import numpy as np
     import matplotlib.ticker as ticker_sp
+    import numpy as np
 
     ax.set_yscale("log")
     ax.yaxis.set_minor_formatter(ticker_sp.NullFormatter())
@@ -431,7 +485,12 @@ def _setup_panel_axes(
         add_vram_reference_lines(ax, unit="MB")
 
 
-MODULE_NAMES = {"nl": "Neighbor List", "d3": "DFT-D3", "el": "Electrostatics"}
+MODULE_NAMES = {
+    "nl": "Neighbor List",
+    "d3": "DFT-D3",
+    "el": "Electrostatics",
+    "dyn": "Dynamics",
+}
 
 
 def _build_mode_title(
@@ -466,6 +525,25 @@ def _build_panel_title(
     return " | ".join(parts)
 
 
+def _nl_method_family(method: str) -> str:
+    """Map legacy and canonical NL method names to a plot family."""
+    if "naive" in method:
+        return "naive"
+    if "cell" in method:
+        return "cell"
+    return method
+
+
+def _nl_method_label(method: str) -> str:
+    """Return a compact display label for an NL method."""
+    family = _nl_method_family(method)
+    if family == "naive":
+        return "Naive"
+    if family == "cell":
+        return "Cell"
+    return method.replace("_neighbor_list", "").replace("_", " ").title()
+
+
 def _should_merge_memory(data: list[dict[str, Any]]) -> bool:
     """Check if cell and naive memory values overlap within tolerance.
 
@@ -474,9 +552,9 @@ def _should_merge_memory(data: list[dict[str, Any]]) -> bool:
     """
     by_cutoff_method = defaultdict(lambda: defaultdict(list))
     for r in data:
-        by_cutoff_method[r.get("cutoff", DEFAULT_CUTOFF)][r.get("method", "?")].append(
-            r.get("mem_peak_gb", 0)
-        )
+        by_cutoff_method[r.get("cutoff", DEFAULT_CUTOFF)][
+            _nl_method_family(r.get("method", "?"))
+        ].append(r.get("mem_peak_gb", 0))
     for methods in by_cutoff_method.values():
         cell_mem = sorted(methods.get("cell", []))
         naive_mem = sorted(methods.get("naive", []))
@@ -525,7 +603,7 @@ def _group_nl_by_cutoff_merged(
     """
     grouped = defaultdict(list)
     for r in data:
-        if r["method"] == "cell":
+        if _nl_method_family(r["method"]) == "cell":
             grouped[r.get("cutoff", DEFAULT_CUTOFF)].append(r)
     if not grouped:
         for r in data:
@@ -563,7 +641,7 @@ def _render_nl_batch(
         # Memory: group by aps only, use cell data, label "Cell/Naive"
         grouped = defaultdict(list)
         for r in data_15:
-            if r["method"] == "cell":
+            if _nl_method_family(r["method"]) == "cell":
                 grouped[r["atoms_per_system"]].append(r)
         if not grouped:  # fallback to naive
             for r in data_15:
@@ -605,8 +683,8 @@ def _render_nl_batch(
             rows = grouped[(method, aps)]
             x = [r["total_atoms"] for r in rows]
             y = _get_panel_y(rows, panel)
-            is_naive = method == "naive"
-            method_str = "Naive" if is_naive else "Cell"
+            is_naive = _nl_method_family(method) == "naive"
+            method_str = _nl_method_label(method)
             _plot_data_line(
                 ax,
                 x,
@@ -656,7 +734,7 @@ def _render_nl_by_cutoff(
             rows = grouped[(method, cutoff)]
             x = [r[x_key] for r in rows]
             y = _get_panel_y(rows, panel)
-            is_naive = method == "naive"
+            is_naive = _nl_method_family(method) == "naive"
             _plot_data_line(
                 ax,
                 x,
@@ -664,12 +742,16 @@ def _render_nl_by_cutoff(
                 color=CUTOFF_COLORS.get(cutoff, GRAY),
                 linestyle=SECONDARY_LINESTYLE if is_naive else "-",
                 marker="s" if is_naive else "o",
-                label=format_legend_label(method.capitalize(), cutoff),
+                label=format_legend_label(_nl_method_label(method), cutoff),
             )
 
 
 def render_nl_panel(
-    ax: Axes, data: list[dict[str, Any]], system: str, mode: str, panel: str,
+    ax: Axes,
+    data: list[dict[str, Any]],
+    system: str,
+    mode: str,
+    panel: str,
 ) -> None:
     """Render a single NL panel onto *ax*.
 
@@ -724,7 +806,11 @@ def render_nl_panel(
 
 
 def render_d3_panel(
-    ax: Axes, data: list[dict[str, Any]], system: str, mode: str, panel: str,
+    ax: Axes,
+    data: list[dict[str, Any]],
+    system: str,
+    mode: str,
+    panel: str,
 ) -> None:
     """Render a single D3 panel onto *ax*.
 
@@ -811,7 +897,11 @@ def render_d3_panel(
 
 
 def render_el_panel(
-    ax: Axes, data: list[dict[str, Any]], system: str, mode: str, panel: str,
+    ax: Axes,
+    data: list[dict[str, Any]],
+    system: str,
+    mode: str,
+    panel: str,
 ) -> None:
     """Render a single Electrostatics panel onto *ax*.
 
@@ -927,6 +1017,214 @@ def render_el_panel(
     )
 
 
+_DYN_METHOD_LABELS = {
+    "velocity_verlet": "VV",
+    "langevin": "Langevin",
+    "npt": "NPT",
+    "nph": "NPH",
+    "fire": "FIRE",
+    "fire2": "FIRE2",
+}
+
+_DYN_METHOD_STYLES = {
+    "velocity_verlet": {"color": NVIDIA_GREEN, "marker": "o", "linestyle": "-"},
+    "langevin": {"color": "#31688E", "marker": "s", "linestyle": "-"},
+    "npt": {"color": "#E67E22", "marker": "^", "linestyle": "-"},
+    "nph": {"color": "#440154", "marker": "D", "linestyle": "-"},
+    "fire": {"color": GRAY, "marker": "P", "linestyle": SECONDARY_LINESTYLE},
+    "fire2": {"color": "#17BECF", "marker": "X", "linestyle": SECONDARY_LINESTYLE},
+}
+
+
+def _dyn_method_label(method: str) -> str:
+    """Return compact display label for a dynamics method."""
+    return _DYN_METHOD_LABELS.get(method, method.replace("_", " ").title())
+
+
+def _dyn_axis_config(values: list[int]) -> tuple[list[int], tuple[int, int]]:
+    """Build log-axis ticks and limits from dynamics x-values."""
+    ticks = sorted({int(v) for v in values if int(v) > 0})
+    if not ticks:
+        return [1, 2], (1, 2)
+    lo = ticks[0]
+    hi = ticks[-1]
+    if lo == hi:
+        lo = max(1, lo // 2)
+        hi = max(lo + 1, hi * 2)
+    return ticks, (lo, hi)
+
+
+def _get_dyn_y(row: dict[str, Any], panel: str) -> float | None:
+    """Extract one dynamics y-value using atom-step units."""
+    if panel == "time":
+        value = row.get("time_us_per_atom_step")
+        if value is None and row.get("avg_step_time_ms") is not None:
+            atoms = max(int(row.get("atoms_per_system", 1)), 1)
+            value = row["avg_step_time_ms"] * 1000.0 / atoms
+    elif panel == "throughput":
+        value = row.get("throughput_atom_steps_per_s")
+        if value is not None:
+            value = value / 1e6
+    else:
+        return None
+
+    if isinstance(value, (int, float)) and math.isfinite(value) and value > 0:
+        return float(value)
+    return None
+
+
+def _finalize_dyn_panel(
+    ax: Axes,
+    panel: str,
+    mode: str,
+    x_ticks: list[int],
+    x_limits: tuple[int, int],
+    x_label: str,
+    target_atoms: int | None,
+) -> None:
+    """Apply axes and legend styling for dynamics plots."""
+    if mode == "constant_workload" and target_atoms is not None:
+        setup_log2_xaxis(
+            ax,
+            ticks=x_ticks,
+            limits=x_limits,
+            show_batch_size=True,
+            target_atoms=target_atoms,
+            label=x_label,
+        )
+    else:
+        setup_log2_xaxis(ax, ticks=x_ticks, limits=x_limits, label=x_label)
+    _setup_panel_axes(ax, panel, x_ticks, x_limits, x_label)
+    if panel == "time":
+        ax.set_ylabel("Time per atom-step [\u03bcs]", fontsize=AXIS_LABEL_SIZE)
+    elif panel == "throughput":
+        ax.set_ylabel("Throughput [10\u2076 atom-steps/s]", fontsize=AXIS_LABEL_SIZE)
+    handles, labels = ax.get_legend_handles_labels()
+    if len(labels) > 12:
+        ax.legend(
+            handles,
+            labels,
+            loc="upper left",
+            bbox_to_anchor=(1.02, 1.0),
+            borderaxespad=0.0,
+            frameon=True,
+            fancybox=True,
+            framealpha=0.9,
+            fontsize=7,
+        )
+    else:
+        ax.legend(loc="best", frameon=True, fancybox=True, framealpha=0.9)
+
+
+def render_dyn_panel(
+    ax: Axes,
+    data: list[dict[str, Any]],
+    system: str,
+    mode: str,
+    panel: str,
+) -> None:
+    """Render a single dynamics panel onto *ax*.
+
+    Dynamics CSVs report wall time per integration/optimization step and
+    atom-step throughput, not per-kernel memory. The memory panel is kept as
+    an explicit placeholder so ``--plots all`` still produces a complete
+    figure set without implying a VRAM measurement.
+    """
+    target = None
+    mode_str = _build_mode_title(mode, data=data, module="dyn")
+
+    if panel == "memory":
+        ax.set_axis_off()
+        ax.text(
+            0.5,
+            0.5,
+            "Memory not captured\nfor dynamics",
+            transform=ax.transAxes,
+            ha="center",
+            va="center",
+            fontsize=AXIS_LABEL_SIZE,
+            color=GRAY,
+        )
+        ax.set_title(_build_panel_title("dyn", system, mode_str), fontsize=TITLE_SIZE)
+        return
+
+    if mode == "batch_scaling":
+        x_key = "batch_size"
+        x_label = "Batch Size"
+    else:
+        x_key = "atoms_per_system"
+        x_label = "Atoms per System"
+        if mode == "constant_workload" and data:
+            target = data[0].get("total_atoms", DEFAULT_TOTAL_ATOMS)
+
+    grouped = defaultdict(list)
+    for row in data:
+        key = (
+            row.get("method", "unknown"),
+            row.get("atoms_per_system", 0) if mode == "batch_scaling" else None,
+        )
+        grouped[key].append(row)
+
+    x_values: list[int] = []
+    plotted = False
+    for key in sorted(grouped.keys(), key=lambda item: (item[1] or 0, item[0])):
+        method, atoms_per_system = key
+        rows = sorted(grouped[key], key=lambda row: row.get(x_key, 0))
+        x: list[int] = []
+        y: list[float] = []
+        for row in rows:
+            y_value = _get_dyn_y(row, panel)
+            if y_value is None:
+                continue
+            x.append(int(row[x_key]))
+            y.append(y_value)
+        if not x:
+            continue
+        x_values.extend(x)
+        style = _DYN_METHOD_STYLES.get(
+            method,
+            {"color": GRAY, "marker": "o", "linestyle": "-"},
+        )
+        label = _dyn_method_label(method)
+        if atoms_per_system:
+            label = f"{label} N={format_num(atoms_per_system)}"
+        _plot_data_line(
+            ax,
+            x,
+            y,
+            color=style["color"],
+            linestyle=style["linestyle"],
+            marker=style["marker"],
+            label=label,
+        )
+        plotted = True
+
+    ax.set_title(_build_panel_title("dyn", system, mode_str), fontsize=TITLE_SIZE)
+    if not plotted:
+        ax.text(
+            0.5,
+            0.5,
+            "No successful dynamics rows",
+            transform=ax.transAxes,
+            ha="center",
+            va="center",
+            fontsize=AXIS_LABEL_SIZE,
+            color=GRAY,
+        )
+        return
+
+    x_ticks, x_limits = _dyn_axis_config(x_values)
+    _finalize_dyn_panel(
+        ax,
+        panel,
+        mode,
+        x_ticks,
+        x_limits,
+        x_label,
+        target_atoms=target if mode == "constant_workload" else None,
+    )
+
+
 def _get_memory_y(rows: list[dict[str, Any]]) -> list[float | None]:
     """Extract memory y-values, handling JAX XLA pool unreliability.
 
@@ -937,8 +1235,15 @@ def _get_memory_y(rows: list[dict[str, Any]]) -> list[float | None]:
     backend = rows[0].get("backend", "torch") if rows else "torch"
     if backend == "jax":
         vals = [r["mem_delta_mb"] for r in rows]
-        return [v if v > 0 else None for v in vals]
-    return [r["mem_peak_gb"] * 1024 for r in rows]  # GB -> MB
+        return [
+            v if isinstance(v, (int, float)) and math.isfinite(v) and v > 0 else None
+            for v in vals
+        ]
+    values = []
+    for r in rows:
+        v = r["mem_peak_gb"]
+        values.append(v * 1024 if math.isfinite(v) and v > 0 else None)
+    return values
 
 
 def _get_panel_y(rows: list[dict[str, Any]], panel: str) -> list[float | None]:
@@ -1093,7 +1398,7 @@ def plot_comparison_panel(
     for r in data:
         if merge_nl_memory:
             # Only keep cell data, group by backend (+ aps for batch)
-            if r.get("method") != "cell":
+            if _nl_method_family(r.get("method", "")) != "cell":
                 continue
             method_key = "cell/naive"
         else:
@@ -1125,7 +1430,7 @@ def plot_comparison_panel(
     }
     # Which method in each module is the "secondary" line (dashed).
     secondary_methods = {
-        "nl": {"naive"},
+        "nl": {"naive", "naive_neighbor_list", "batch_naive_neighbor_list"},
         "el": {"ewald", "ewald_cg"},
         "d3": set(),  # single method
     }
@@ -1143,7 +1448,7 @@ def plot_comparison_panel(
             y = _get_panel_y(rows, panel)
 
         # Marker by method: circle for primary, square for naive, triangle for ewald
-        if method in ("naive",):
+        if _nl_method_family(method) == "naive":
             marker = "s"
         elif method in ("ewald", "ewald_cg"):
             marker = "^"
@@ -1166,7 +1471,10 @@ def plot_comparison_panel(
             # backend's color family.
             aps_values = sorted({k[2] for k in grouped.keys() if k[2] is not None})
             n = max(len(aps_values), 1)
-            depth = lambda i: 0.45 + 0.45 * (i / max(n - 1, 1))
+
+            def depth(i):
+                return 0.45 + 0.45 * (i / max(n - 1, 1))
+
             torch_palette = [plt.cm.Greens(depth(i)) for i in range(n)]
             jax_palette = [plt.cm.Blues(depth(i)) for i in range(n)]
             palette = torch_palette if backend == "torch" else jax_palette
@@ -1270,10 +1578,8 @@ def generate_comparison_panels(csv_dir: str | Path, output_dir: str | Path) -> N
     output_dir = Path(output_dir)
 
     for csv_path in sorted(csv_dir.glob("*.csv")):
-        # Skip failures sidecars — they share the {module}-* prefix but carry
-        # a different schema (no time_us_per_atom) and the renderer would
-        # raise. generate_plots.py already filters these for single-panel
-        # output; this is the corresponding filter for comparison panels.
+        # Skip legacy failure sidecars if an older results directory contains
+        # them. Current benchmark runs keep failures in the main CSV rows.
         if csv_path.stem.endswith("-failures"):
             continue
         name = csv_path.stem

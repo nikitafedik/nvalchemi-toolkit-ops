@@ -36,51 +36,51 @@ Emitted by `benchmarks.utils.build_result`:
 |---|---|---|
 | `system` | str | `cscl` or `nh3` |
 | `scaling_mode` | str | `system_size`, `constant_workload`, or `batch_scaling` |
-| `method` | str | `naive` / `cell` (NL), `dftd3` (D3), `pme` / `pme_cg` / `ewald` / `ewald_cg` (EL) |
-| `backend` | str | `torch` or `jax` |
+| `method` | str | Public API name: `naive_neighbor_list` / `cell_list` / batch variants (NL), `dftd3` (D3), `pme` / `pme_cg` / `ewald` / `ewald_cg` (EL) |
+| `backend` | str | `torch`, `jax`, or NL-only `warp` |
 | `atoms_per_system` | int | Atoms in one system |
 | `batch_size` | int | Number of systems in the batch |
 | `total_atoms` | int | `atoms_per_system` × `batch_size` |
 | `time_us_per_atom` | float | Mean μs per atom across the batch timing |
 | `throughput_atoms_per_sec` | float | Derived throughput |
-| `mem_delta_mb` | float | Memory delta from the pre-timing measurement call (MB); always 0 for JAX |
-| `mem_peak_gb` | float | Peak torch allocator memory (GB); always 0 for JAX |
+| `mem_delta_mb` | float | Memory delta from the pre-timing measurement call (MB); `NaN` for JAX |
+| `mem_peak_gb` | float | Peak torch allocator memory (GB); `NaN` for JAX |
 | `success` | bool | `False` rows are filtered by the plotter |
 | `cutoff` | float | Added by NL and D3 |
 | `accuracy` | float | Added by EL |
 | `time_d3_us_per_atom` | float | Added by D3 (excludes NL build time) |
+| `neighbor_setup_method` | str | Added by D3; setup API used outside the timed D3 region |
+| `time_real_us_per_atom` | float | Added by EL; real-space component timing |
+| `time_reciprocal_us_per_atom` | float | Added by EL; reciprocal-space component timing |
 
 Multiple runs that write to the same directory are appended rather
 than overwritten when their headers match — this is how torch and jax
 runs coexist in one file.
 
-### Failures sidecar (`*-failures.csv`)
+### Failed rows
 
-Each main CSV may have a matching `*-failures.csv` recording configs that
-were skipped at runtime (OOM in NL build, OOM in the kernel itself, or
-YAML-driven preemptive skips). Schema is a union of the NL/D3/EL columns
-so that one file format works for all three modules:
+Failed benchmark attempts and explicit OOM-policy skips are written into
+the main CSV with `success=False`, `error`, and `error_type`; the plotter
+filters them out.
+Schema is a union of the NL/D3/EL columns so that one file format works
+for all three modules:
 
 | Column | Type | Description |
 |---|---|---|
 | `system` | str | `cscl` or `nh3` |
 | `scaling_mode` | str | `system_size`, `constant_workload`, or `batch_scaling` |
-| `method` | str | Same values as the main CSV (`naive`, `cell`, `pme`, …) |
-| `backend` | str | `torch` or `jax` |
+| `method` | str | Same values as the main CSV (`cell_list`, `batch_cell_list`, `pme`, …) |
+| `backend` | str | `torch`, `jax`, or NL-only `warp` |
 | `atoms_per_system` | int | Atoms in one system |
 | `batch_size` | int | Number of systems in the batch |
 | `cutoff` | float | Populated for NL and D3 rows; blank for EL |
 | `accuracy` | float | Populated for EL rows; blank for NL and D3 |
-| `failure_reason` | str | `OOM_kernel`, `OOM_NL_build`, or `OOM_preempt` |
+| `error` | str | Runtime error message |
+| `error_type` | str | Exception class or skip category, e.g. `SkippedByPolicy` |
 
-**Contract:** a sidecar file is shipped only when the corresponding
-main CSV has at least one skipped config. An absent sidecar means
-"no failures on the reference H100"; it does not mean the run was
-incomplete. Sidecars are ship-only artefacts for downstream
-tooling (analysis scripts that want to distinguish a preempted
-config from one outside the grid). The shipped plotter does not
-read them — `plot_comparison_panel` explicitly skips any CSV whose
-stem ends in `-failures`.
+**Contract:** failed rows stay in the same result CSV as successful rows.
+Plotting code filters `success=False`, while downstream analysis can still
+inspect `error` and `error_type` without joining a sidecar file.
 
 ## Reproducing
 

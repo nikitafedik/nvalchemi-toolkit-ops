@@ -17,6 +17,7 @@ parameters:
   cutoffs: [6.0, 15.0, 25.0]       # Angstroms
   warmup_runs: 10
   timing_runs: 20
+  max_total_atoms: 131072
 
   # Per-cutoff atom limits (larger cutoffs = more memory)
   cutoff_limits:
@@ -59,11 +60,11 @@ scaling:
 # Methods
 # -----------------------------------------------------------------------------
 methods:
-  - name: naive
+  - name: naive_neighbor_list
     enabled: true
     description: "Brute-force O(N²) - best for small systems"
 
-  - name: cell
+  - name: cell_list
     enabled: true
     description: "Cell list O(N) - recommended for large systems"
 

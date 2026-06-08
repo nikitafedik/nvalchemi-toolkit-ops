@@ -16,6 +16,7 @@
 parameters:
   warmup_runs: 10
   timing_runs: 20
+  max_total_atoms: 131072
 
 # -----------------------------------------------------------------------------
 # Systems

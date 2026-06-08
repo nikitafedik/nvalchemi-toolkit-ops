@@ -800,7 +800,7 @@ def build_neighbor_list(
         cutoff_ang,
         cell=cell,
         pbc=pbc,
-        method="cell",
+        method="cell_list",
         return_neighbor_list=False,
     )
 

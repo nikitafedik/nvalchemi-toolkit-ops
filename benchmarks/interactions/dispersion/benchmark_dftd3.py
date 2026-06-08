@@ -1,11 +1,24 @@
 #!/usr/bin/env python3
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2025 - 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 """DFT-D3 Dispersion Benchmark.
 
 CRITICAL: D3 operates in atomic units (Bohr). All positions, cells, and
 cutoffs are converted from Angstroms to Bohr before calling the D3 API.
-Times NL and D3 separately.
+Neighbor-list setup is built outside the timed D3 region.
 
 Usage (run from the repository root):
     python -m benchmarks.interactions.dispersion.benchmark_dftd3 \
@@ -14,7 +27,7 @@ Usage (run from the repository root):
         --config benchmarks/interactions/dispersion/benchmark_config.yaml \
         --output-dir docs/benchmarks/benchmark_results
 
-    # JAX backend
+    # JAX backend (the runner also sets this defensively before importing JAX)
     XLA_PYTHON_CLIENT_PREALLOCATE=false \
         python -m benchmarks.interactions.dispersion.benchmark_dftd3 \
         --config benchmarks/interactions/dispersion/benchmark_config.yaml --backend jax
@@ -29,7 +42,8 @@ events for timing. ``--backend jax`` uses the JAX wrappers in
 
 Environment variables for ``--backend jax``:
 
-- ``XLA_PYTHON_CLIENT_PREALLOCATE=false`` — required, or XLA grabs all VRAM.
+- ``XLA_PYTHON_CLIENT_PREALLOCATE=false`` — set by the runner before importing
+  JAX; exporting it explicitly is also safe.
 """
 
 from __future__ import annotations
@@ -49,6 +63,7 @@ __all__ = [
 
 from benchmarks.config import (
     add_common_cli_args,
+    enabled_method_names,
     load_yaml_config,
     merge_common_cli_overrides,
 )
@@ -60,10 +75,14 @@ from benchmarks.constants import (
 from benchmarks.systems import (
     configs_for_mode,
     create_system,
+    filter_configs_by_total_atoms,
+    planned_atom_counts,
     resolve_nh3_dir,
 )
 from benchmarks.utils import (
+    build_failure_result,
     build_result,
+    build_skipped_result,
     clean_gpu,
     create_run_directory,
     cuda_timed_runs,
@@ -79,7 +98,7 @@ from benchmarks.utils import (
 )
 from nvalchemiops.neighbors import estimate_max_neighbors
 from nvalchemiops.torch.interactions.dispersion import dftd3
-from nvalchemiops.torch.neighbors import batch_cell_list
+from nvalchemiops.torch.neighbors import batch_cell_list, cell_list
 
 
 def _torch_d3_params_to_jax(torch_params, jnp):
@@ -118,7 +137,10 @@ def benchmark_d3(
     warmup_runs: int = 3,
     backend: str = "torch",
 ) -> dict:
-    """Benchmark D3 for a single configuration. Times NL and D3 separately.
+    """Benchmark D3 for a single configuration.
+
+    Neighbor-list setup is performed outside the timed and memory-measured
+    D3 closure so the canonical CSV timing measures DFT-D3 only.
 
     Parameters
     ----------
@@ -136,6 +158,7 @@ def benchmark_d3(
     pbc = data["pbc"]
     batch_idx = data["batch_idx"]
     numbers = data["atomic_numbers"]
+    batch_size = int(data.get("batch_size", 1))
 
     # Convert to Bohr
     pos_bohr = positions * ANGSTROM_TO_BOHR
@@ -153,35 +176,17 @@ def benchmark_d3(
     a2 = d3_func_params["a2"]
     s8 = d3_func_params["s8"]
 
-    # Single warmup: build NL + run D3, capture memory
-    def warmup_d3():
-        nb, _, nb_shifts = batch_cell_list(
+    if batch_size == 1:
+        nbmat, _, nbmat_shifts = cell_list(
             positions=pos_bohr,
             cell=cell_bohr,
             pbc=pbc,
             cutoff=cutoff_bohr,
-            batch_idx=batch_idx,
             max_neighbors=maxnb,
         )
-        dftd3(
-            positions=pos_bohr,
-            cell=cell_bohr,
-            numbers=numbers,
-            batch_idx=batch_idx,
-            neighbor_matrix=nb,
-            neighbor_matrix_shifts=nb_shifts,
-            d3_params=d3_params,
-            a1=a1,
-            a2=a2,
-            s8=s8,
-        )
-        return nb, nb_shifts
-
-    (nbmat, nbmat_shifts), mem_info = measure_memory_torch(warmup_d3)
-
-    # NL timing
-    def run_nl():
-        nonlocal nbmat, nbmat_shifts
+        d3_batch_idx = None
+        neighbor_setup_method = "cell_list"
+    else:
         nbmat, _, nbmat_shifts = batch_cell_list(
             positions=pos_bohr,
             cell=cell_bohr,
@@ -190,16 +195,15 @@ def benchmark_d3(
             batch_idx=batch_idx,
             max_neighbors=maxnb,
         )
+        d3_batch_idx = batch_idx
+        neighbor_setup_method = "batch_cell_list"
 
-    time_nl = cuda_timed_runs(run_nl, num_runs, warmup_runs=warmup_runs)
-
-    # D3 timing (uses pre-computed NL from last run_nl call)
     def run_d3():
         dftd3(
             positions=pos_bohr,
             cell=cell_bohr,
             numbers=numbers,
-            batch_idx=batch_idx,
+            batch_idx=d3_batch_idx,
             neighbor_matrix=nbmat,
             neighbor_matrix_shifts=nbmat_shifts,
             d3_params=d3_params,
@@ -208,13 +212,13 @@ def benchmark_d3(
             s8=s8,
         )
 
+    _, mem_info = measure_memory_torch(run_d3)
     time_d3 = cuda_timed_runs(run_d3, num_runs, warmup_runs=warmup_runs)
 
     return {
-        "time_nl_seconds": time_nl,
         "time_d3_seconds": time_d3,
-        "time_total_seconds": time_nl + time_d3,
         "mem_info": mem_info,
+        "neighbor_setup_method": neighbor_setup_method,
     }
 
 
@@ -239,10 +243,8 @@ def _benchmark_d3_jax(data, cutoff, d3_params, d3_func_params, num_runs, warmup_
     atoms_per_system = int(data["atoms_per_system"])
     batch_size = int(data.get("batch_size", 1))
 
-    # Under jax.jit, NL needs explicit max_total_cells (cell list sizing
-    # reads traced cell geometry) and D3 needs num_systems / batch_ptr
-    # (can't infer from ``batch_idx.max()`` inside a trace). All computed
-    # once here so the timed closures can be traced cleanly.
+    # Under jax.jit, NL needs explicit max_total_cells because cell-list
+    # sizing reads traced cell geometry.
     batch_ptr = jnp.arange(batch_size + 1, dtype=jnp.int32) * atoms_per_system
 
     # Convert to Bohr
@@ -256,9 +258,12 @@ def _benchmark_d3_jax(data, cutoff, d3_params, d3_func_params, num_runs, warmup_
         safety_factor=DEFAULT_NL_SAFETY_FACTOR,
     )
 
+    setup_batch_ptr = batch_ptr
+    if batch_size == 1:
+        setup_batch_ptr = jnp.asarray([0, atoms_per_system], dtype=jnp.int32)
     max_total_cells, _, _ = estimate_bcl_sizes(
         positions=pos_bohr,
-        batch_ptr=batch_ptr,
+        batch_ptr=setup_batch_ptr,
         cell=cell_bohr,
         cutoff=float(cutoff_bohr),
         pbc=pbc,
@@ -270,10 +275,21 @@ def _benchmark_d3_jax(data, cutoff, d3_params, d3_func_params, num_runs, warmup_
     a2 = d3_func_params["a2"]
     s8 = d3_func_params["s8"]
 
-    # Warmup: build NL + run D3, capture memory via NVML. Return the NL
-    # buffers so the per-kernel timing runs below can reuse them.
-    def warmup_d3_jax():
-        nb, _, nb_shifts = jax_nl(
+    if batch_size == 1:
+        nbmat, _, nbmat_shifts = jax_nl(
+            positions=pos_bohr,
+            cutoff=float(cutoff_bohr),
+            cell=cell_bohr,
+            pbc=pbc,
+            method="cell_list",
+            return_neighbor_list=False,
+            max_neighbors=int(maxnb),
+            max_total_cells=max_total_cells,
+        )
+        d3_batch_idx = None
+        neighbor_setup_method = "cell_list"
+    else:
+        nbmat, _, nbmat_shifts = jax_nl(
             positions=pos_bohr,
             cutoff=float(cutoff_bohr),
             cell=cell_bohr,
@@ -285,45 +301,9 @@ def _benchmark_d3_jax(data, cutoff, d3_params, d3_func_params, num_runs, warmup_
             max_neighbors=int(maxnb),
             max_total_cells=max_total_cells,
         )
-        jax.block_until_ready(nb)
-        out = jax_dftd3(
-            positions=pos_bohr,
-            numbers=numbers,
-            a1=float(a1),
-            a2=float(a2),
-            s8=float(s8),
-            d3_params=d3_params,
-            batch_idx=batch_idx,
-            num_systems=batch_size,
-            cell=cell_bohr,
-            neighbor_matrix=nb,
-            neighbor_matrix_shifts=nb_shifts,
-        )
-        return nb, nb_shifts, out
-
-    (nbmat, nbmat_shifts, _), mem_info = measure_memory_jax(warmup_d3_jax, jax)
-
-    # NL timing — each call returns fresh buffers
-    def run_nl():
-        return jax_nl(
-            positions=pos_bohr,
-            cutoff=float(cutoff_bohr),
-            cell=cell_bohr,
-            pbc=pbc,
-            batch_idx=batch_idx,
-            batch_ptr=batch_ptr,
-            method="batch_cell_list",
-            return_neighbor_list=False,
-            max_neighbors=int(maxnb),
-            max_total_cells=max_total_cells,
-        )
-
-    # jit so the timed loop reflects steady-state per-call cost, not
-    # Python-side tracing on every iteration.
-    run_nl_jit = jax.jit(run_nl)
-    time_nl = cuda_timed_runs(
-        run_nl_jit, num_runs, warmup_runs=warmup_runs, backend="jax"
-    )
+        d3_batch_idx = batch_idx
+        neighbor_setup_method = "batch_cell_list"
+    jax.block_until_ready(nbmat)
 
     # D3 timing — reuse the NL buffers we already have. Pass d3_params
     # and other large arrays as explicit jit arguments (not closure
@@ -350,17 +330,18 @@ def _benchmark_d3_jax(data, cutoff, d3_params, d3_func_params, num_runs, warmup_
 
     def run_d3_jit():
         return _run_d3_kernel_jit(
-            pos_bohr, numbers, cell_bohr, batch_idx, nbmat, nbmat_shifts, d3_params
+            pos_bohr, numbers, cell_bohr, d3_batch_idx, nbmat, nbmat_shifts, d3_params
         )
+
+    _, mem_info = measure_memory_jax(run_d3_jit, jax)
     time_d3 = cuda_timed_runs(
         run_d3_jit, num_runs, warmup_runs=warmup_runs, backend="jax"
     )
 
     return {
-        "time_nl_seconds": time_nl,
         "time_d3_seconds": time_d3,
-        "time_total_seconds": time_nl + time_d3,
         "mem_info": mem_info,
+        "neighbor_setup_method": neighbor_setup_method,
     }
 
 
@@ -382,9 +363,8 @@ def _d3_run_one_cutoff(
 ):
     """Run :func:`benchmark_d3` for one ``cutoff`` and build a result row.
 
-    Catches OOM and other exceptions; returns None on failure so the caller
-    can continue. Keeps the inner loop in :func:`run_from_config` free of
-    try/except nesting.
+    Catches OOM and other exceptions and emits ``success=False`` rows.
+    Keeps the inner loop in :func:`run_from_config` free of try/except nesting.
     """
     try:
         r = benchmark_d3(
@@ -401,26 +381,120 @@ def _d3_run_one_cutoff(
         )
         result = build_result(
             method="dftd3",
-            time_seconds=r["time_total_seconds"],
+            time_seconds=r["time_d3_seconds"],
             mem_info=r["mem_info"],
             cutoff=cutoff,
             time_d3_us_per_atom=time_d3_us_per_atom,
+            neighbor_setup_method=r["neighbor_setup_method"],
             **row_meta,
         )
-        mem_suffix = (
-            f" | {result['mem_delta_mb']:.1f} MB" if backend == "torch" else ""
-        )
-        print(
-            f"    {cutoff}Å: D3={time_d3_us_per_atom:.3f} μs/atom{mem_suffix}"
-        )
+        mem_suffix = f" | {result['mem_delta_mb']:.1f} MB" if backend == "torch" else ""
+        print(f"    {cutoff}Å: D3={time_d3_us_per_atom:.3f} μs/atom{mem_suffix}")
         return result
-    except torch.cuda.OutOfMemoryError:
+    except torch.cuda.OutOfMemoryError as e:
         print(f"    {cutoff}Å: OOM")
         clean_gpu()
-        return None
+        return build_failure_result(
+            method="dftd3",
+            cutoff=cutoff,
+            error=str(e),
+            error_type=type(e).__name__,
+            **row_meta,
+        )
     except Exception as e:
         print(f"    {cutoff}Å: FAILED - {e}")
-        return None
+        return build_failure_result(
+            method="dftd3",
+            cutoff=cutoff,
+            error=str(e),
+            error_type=type(e).__name__,
+            **row_meta,
+        )
+
+
+def dry_run_from_config(config: dict, backend: str | None = None) -> list[dict]:
+    """Print and return the expanded D3 benchmark plan without allocation."""
+    params = config["parameters"]
+    cutoffs = params["cutoffs"]
+    cutoff_limits = params.get("cutoff_limits", {})
+    max_total_atoms = params.get("max_total_atoms")
+    methods = enabled_method_names(config) if "methods" in config else ["dftd3"]
+    if backend is None:
+        backend = config.get("runtime", {}).get("backend", "torch")
+    if "dftd3" not in methods:
+        print("D3 dry-run plan")
+        selected = ", ".join(methods) if methods else "(none)"
+        print(f"D3 dry-run no enabled methods for selected methods: {selected}")
+        print("D3 dry-run rows: 0")
+        return []
+    rows = []
+    for sys_name, sys_config in config["systems"].items():
+        if not sys_config.get("enabled", True):
+            continue
+        nh3_dir = resolve_nh3_dir(sys_config)
+        for mode_name, mode_config in config["scaling"].items():
+            if not isinstance(mode_config, dict) or not mode_config.get(
+                "enabled", True
+            ):
+                continue
+            configs = configs_for_mode(
+                mode_name, mode_config, sys_name, sys_config, nh3_dir
+            )
+            configs, skipped = filter_configs_by_total_atoms(
+                configs, sys_name, max_total_atoms
+            )
+            for cfg, total_atoms in skipped:
+                atoms_per_system, batch_size, _ = planned_atom_counts(sys_name, cfg)
+                rows.extend(
+                    {
+                        "benchmark": "d3",
+                        "backend": backend,
+                        "system": sys_name,
+                        "mode": mode_name,
+                        "atoms_per_system": atoms_per_system,
+                        "batch_size": batch_size,
+                        "total_atoms": total_atoms,
+                        "method": "dftd3",
+                        "cutoff": cutoff,
+                        "reason": f">{max_total_atoms} max_total_atoms",
+                    }
+                    for cutoff in cutoffs
+                )
+            for cfg in configs:
+                atoms_per_system, batch_size, total_atoms = planned_atom_counts(
+                    sys_name, cfg
+                )
+                for cutoff in cutoffs:
+                    limit = cutoff_limits.get(cutoff) or cutoff_limits.get(str(cutoff))
+                    reason = (
+                        f">{limit} cutoff_limit"
+                        if limit and total_atoms > limit
+                        else ""
+                    )
+                    rows.append(
+                        {
+                            "benchmark": "d3",
+                            "backend": backend,
+                            "system": sys_name,
+                            "mode": mode_name,
+                            "atoms_per_system": atoms_per_system,
+                            "batch_size": batch_size,
+                            "total_atoms": total_atoms,
+                            "method": "dftd3",
+                            "cutoff": cutoff,
+                            "reason": reason,
+                        }
+                    )
+    print("D3 dry-run plan")
+    for row in rows:
+        suffix = f" SKIP {row['reason']}" if row["reason"] else ""
+        print(
+            "  {system}/{mode} backend={backend} method={method} "
+            "N={atoms_per_system} batch={batch_size} total={total_atoms} "
+            "cutoff={cutoff}{suffix}".format(**row, suffix=suffix)
+        )
+    print(f"D3 dry-run rows: {len(rows)}")
+    return rows
 
 
 def run_from_config(
@@ -440,10 +514,21 @@ def run_from_config(
     num_runs = params["timing_runs"]
     warmup_runs = params["warmup_runs"]
     cutoffs = params["cutoffs"]
+    cutoff_limits = params.get("cutoff_limits", {})
+    max_total_atoms = params.get("max_total_atoms")
     d3_func_params = config["dftd3_parameters"]
+    methods = enabled_method_names(config) if "methods" in config else ["dftd3"]
 
     if backend is None:
         backend = config.get("runtime", {}).get("backend", "torch")
+    if backend == "warp":
+        raise ValueError("D3 benchmark supports torch and jax backends, not warp.")
+    if config.get("runtime", {}).get("dry_run", False):
+        return dry_run_from_config(config, backend=backend)
+    if "dftd3" not in methods:
+        selected = ", ".join(methods) if methods else "(none)"
+        print(f"D3 benchmark no enabled methods for selected methods: {selected}")
+        return []
 
     # Load D3 reference parameters (YAML is authoritative for the path)
     d3_params_path = Path(config["params_path"]).expanduser()
@@ -495,10 +580,42 @@ def run_from_config(
             configs = configs_for_mode(
                 mode_name, mode_config, sys_name, sys_config, nh3_dir
             )
-            if not configs:
-                continue
-
+            configs, skipped = filter_configs_by_total_atoms(
+                configs, sys_name, max_total_atoms
+            )
             results = []
+            for cfg, skipped_total in skipped:
+                print(
+                    f"  SKIP total atoms {format_num(skipped_total)} "
+                    f"(>{format_num(max_total_atoms)})"
+                )
+                atoms_per_system, batch_size, total_atoms = planned_atom_counts(
+                    sys_name, cfg
+                )
+                row_meta = make_row_meta(
+                    sys_name,
+                    mode_name,
+                    backend,
+                    atoms_per_system,
+                    batch_size,
+                    total_atoms,
+                )
+                reason = f">{max_total_atoms} max_total_atoms"
+                results.extend(
+                    build_skipped_result(
+                        method="dftd3",
+                        cutoff=cutoff,
+                        reason=reason,
+                        **row_meta,
+                    )
+                    for cutoff in cutoffs
+                )
+            if not configs:
+                if results:
+                    csv_name = make_csv_name("d3", sys_name, mode_name)
+                    save_results(results, output_dir / csv_name)
+                    all_results.extend(results)
+                continue
 
             for cfg in configs:
                 n, bs = cfg["num_atoms"], cfg["batch_size"]
@@ -532,6 +649,21 @@ def run_from_config(
                     )
 
                     for cutoff in cutoffs:
+                        limit = cutoff_limits.get(cutoff) or cutoff_limits.get(
+                            str(cutoff)
+                        )
+                        if limit and actual_total > limit:
+                            print(f"    {cutoff}Å: SKIP (>{format_num(limit)} limit)")
+                            results.append(
+                                build_skipped_result(
+                                    method="dftd3",
+                                    cutoff=cutoff,
+                                    reason=f">{limit} cutoff_limit",
+                                    **row_meta,
+                                )
+                            )
+                            continue
+
                         if data["cell_size"] < 2 * cutoff:
                             print(
                                 f"    {cutoff}Å: WARNING cell {data['cell_size']:.1f}Å < 2×cutoff (benchmarking anyway)"

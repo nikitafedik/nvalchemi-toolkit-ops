@@ -8,6 +8,125 @@
 #   - md_batch: Batched MD benchmarks (nvalchemiops vs torch-sim)
 #   - opt_batch: Batched optimization benchmarks (nvalchemiops vs torch-sim)
 
+# Unified-suite Batched Dynamics Benchmarks
+# -----------------------------------------
+# Used by benchmarks.dynamics.benchmark_dynamics and benchmark_suite.py.
+# The legacy sections below are preserved for the older standalone scripts.
+parameters:
+  warmup_runs: 10
+  timing_runs: 20
+  max_total_atoms: 131072
+  dtype: "float64"
+  seed: 42
+  position_perturbation: 0.01
+
+systems:
+  lj:
+    enabled: true
+    atom_counts: [16, 32, 64, 128, 256, 512, 1024, 2048, 4096]
+    batch_atom_counts: [16, 64, 256, 1024]
+    constant_atoms_sizes: [16, 64, 256, 1024]
+
+scaling:
+  system_size:
+    enabled: true
+    batch_size: 1
+
+  constant_workload:
+    enabled: true
+    target_atoms: 131072
+    atoms_per_system: [16, 64, 256, 1024]
+
+  batch_scaling:
+    enabled: true
+    batch_sizes: [1, 4, 16, 64, 256]
+    atoms_per_system: [16, 64, 256, 1024]
+
+methods:
+  - name: velocity_verlet
+    enabled: true
+    family: md
+    description: "Batched NVE Velocity Verlet integrator"
+    steps: 1000
+    dt: 0.001
+    warmup_steps: 100
+    log_interval: 100
+
+  - name: langevin
+    enabled: true
+    family: md
+    description: "Batched NVT Langevin integrator"
+    steps: 1000
+    dt: 0.001
+    warmup_steps: 100
+    temperature: 94.4
+    friction: 0.01
+    log_interval: 100
+
+  - name: npt
+    enabled: true
+    family: md
+    description: "Batched NPT integrator"
+    steps: 1000
+    dt: 0.0001
+    warmup_steps: 100
+    temperature: 10.0
+    pressure: 1.0
+    tau_t: 500.0
+    tau_p: 1000.0
+    chain_length: 3
+    log_interval: 100
+
+  - name: nph
+    enabled: true
+    family: md
+    description: "Batched NPH integrator"
+    steps: 1000
+    dt: 0.001
+    warmup_steps: 100
+    temperature: 10.0
+    pressure: 1.0
+    tau_p: 1000.0
+    log_interval: 100
+
+  - name: fire
+    enabled: true
+    family: opt
+    description: "Batched FIRE optimizer"
+    max_steps: 1000
+    force_tolerance: 0.01
+    dt_start: 0.05
+    dt_max: 0.08
+    dt_min: 0.005
+    alpha_start: 0.090
+    n_min: 5
+    f_inc: 1.05
+    f_dec: 0.75
+    f_alpha: 0.985
+    maxstep: 0.1
+    warmup_steps: 100
+    log_interval: 100
+    check_interval: 20
+
+  - name: fire2
+    enabled: true
+    family: opt
+    description: "Batched FIRE2 optimizer"
+    max_steps: 1000
+    force_tolerance: 0.01
+    dt_start: 0.045
+    tmax: 0.08
+    tmin: 0.005
+    delaystep: 5
+    dtgrow: 1.05
+    dtshrink: 0.75
+    alpha0: 0.09
+    alphashrink: 0.985
+    maxstep: 0.1
+    warmup_steps: 100
+    log_interval: 100
+    check_interval: 20
+
 # Single-System MD Benchmarks
 # ---------------------------
 md_single:
@@ -332,6 +451,8 @@ hardware:
 # Output Configuration
 # --------------------
 output:
+  base_dir: "../benchmark-results"
+
   # Output directory for CSV results
   results_dir: "../docs/benchmarks/benchmark_results"
 

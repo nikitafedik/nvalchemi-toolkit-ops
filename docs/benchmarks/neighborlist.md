@@ -460,8 +460,8 @@ keep the plot readable.
 | Parameter | Value |
 | --------- | ----- |
 | Cutoffs | 6.0, 15.0, 25.0 Å |
-| Methods | naive, cell list |
-| System Type | CsCl (pymatgen), NH₃ (PDB) |
+| Methods | `naive_neighbor_list`, `cell_list`; batch runs use `batch_naive_neighbor_list`, `batch_cell_list` |
+| System Type | CsCl (programmatic supercells), NH₃ (PDB) |
 | Warmup Iterations | 10 |
 | Timing Iterations | 20 |
 | Dtype | `float32` |

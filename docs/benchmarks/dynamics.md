@@ -14,8 +14,9 @@ and we encourage users to benchmark on their own systems of interest.
 ## How to Read These Charts
 
 Time Scaling
-: Average time per MD/optimization step (ms) vs. system size. Lower is better.
-  For batched runs, this is the time to process all systems in the batch.
+: Average time per atom-step or per MD/optimization step vs. system size,
+  depending on the plot source. Lower is better. For batched runs, each step
+  processes all systems in the batch.
 
 Throughput
 : Atom-steps processed per second. Higher is better. For batched systems, this
@@ -29,6 +30,39 @@ Ensemble
 Batch Size
 : Number of independent systems processed simultaneously. Batch size of 1 represents
   single-system mode.
+
+## Unified Suite Runner
+
+The primary benchmark entry point is `benchmarks.benchmark_suite`, consistent
+with the neighbor-list, DFT-D3, and electrostatics benchmarks. It reads
+`benchmarks/dynamics/benchmark_config.yaml`, applies shared CLI overrides, writes
+`dyn-lj-<mode>.csv`, and generates the same 3-panel and single-panel PNG layout
+as the other modules.
+
+Dynamics currently supports the `torch` backend only. The timed loop lives in
+`NvalchemiOpsBenchmark`: warmup steps run first, `wp.synchronize()` is called
+before and after the timed step loop, and the reported value is the mean wall
+time per full MD/optimization step.
+
+Supported methods are `velocity_verlet`, `langevin`, `npt`, `nph`, `fire`, and
+`fire2`. Convenience aliases include `vv` and `nve` for `velocity_verlet`, and
+`fire1` for `fire`.
+
+```bash
+WARP_CACHE_PATH=/tmp/warp-cache-toolkit-ops \
+python -m benchmarks.benchmark_suite --benchmark dyn --backend torch \
+    --system lj --mode batch_scaling --method vv fire2 \
+    --timing-runs 3 --warmup-runs 1 --max-total-atoms 2048 \
+    --output-dir /tmp/dyn-smoke
+```
+
+For a full dynamics run, omit the smoke-test overrides:
+
+```bash
+WARP_CACHE_PATH=/tmp/warp-cache-toolkit-ops \
+python -m benchmarks.benchmark_suite --benchmark dyn --backend torch \
+    --output-dir docs/benchmarks/benchmark_results
+```
 
 ## Molecular Dynamics (MD)
 
@@ -243,34 +277,10 @@ Total throughput (atom-steps/s) for batched optimization.
 - System sizes: 256, 512, 1024 atoms per system
 - Batch sizes: 1, 2, 4, 8, 16, 32 systems
 
-## Running Your Own Benchmarks
+## Additional Dynamics Scripts
 
-To reproduce these benchmarks or test on your own hardware:
-
-### Single-System MD
-
-```bash
-cd benchmarks/dynamics
-python benchmark_md_single.py --config benchmark_config.yaml
-```
-
-### Batched MD
-
-```bash
-python benchmark_md_batch.py --config benchmark_config.yaml
-```
-
-### Single-System Optimization
-
-```bash
-python benchmark_opt_single.py --config benchmark_config.yaml
-```
-
-### Batched Optimization
-
-```bash
-python benchmark_opt_batch.py --config benchmark_config.yaml
-```
+The older dynamics scripts remain available for focused deep dives outside the
+unified suite CSV/plot schema.
 
 ### FIRE1 vs FIRE2 Comparison
 
@@ -290,55 +300,51 @@ sizes across float32 and float64:
 python benchmark_fire2.py --config benchmark_config.yaml --output-dir ./benchmark_results
 ```
 
+### Legacy Single/Batch Sweeps
+
+```bash
+cd benchmarks/dynamics
+python benchmark_md_single.py --config benchmark_config.yaml
+python benchmark_md_batch.py --config benchmark_config.yaml
+python benchmark_opt_single.py --config benchmark_config.yaml
+python benchmark_opt_batch.py --config benchmark_config.yaml
+```
+
 ### Configuration File
 
 Edit `benchmark_config.yaml` to customize benchmarks:
 
 ```yaml
-# MD single-system
-md_single:
-  enabled: true
-  system_sizes: [256, 512, 1024, 2048, 4096]
-  integrators:
-    velocity_verlet:
-      steps: 10000
-      dt: 0.001  # fs
-      warmup_steps: 100
-    langevin:
-      steps: 10000
-      dt: 0.001
-      temperature: 300.0  # K
-      friction: 0.01  # 1/fs
+parameters:
+  warmup_runs: 10
+  timing_runs: 20
+  max_total_atoms: null
 
-# MD batched
-md_batch:
-  enabled: true
-  system_sizes: [256, 512, 1024]
-  batch_sizes: [1, 2, 4, 8, 16, 32]
-  integrators:
-    velocity_verlet:
-      steps: 10000
-      dt: 0.001
-      warmup_steps: 100
+systems:
+  lj:
+    enabled: true
+    atom_counts: [256, 512, 1024, 2048, 4096]
 
-# Optimization single-system
-opt_single:
-  enabled: true
-  system_sizes: [256, 512, 1024, 2048]
-  optimizers:
-    fire:
-      max_steps: 1000
-      force_tolerance: 0.01  # eV/Å
+scaling:
+  system_size:
+    enabled: true
+    batch_size: 1
+  constant_workload:
+    enabled: true
+    target_atoms: 131072
+  batch_scaling:
+    enabled: true
+    batch_sizes: [1, 2, 4, 8, 16, 32]
 
-# Optimization batched
-opt_batch:
-  enabled: true
-  system_sizes: [256, 512]
-  batch_sizes: [1, 2, 4, 8, 16]
-  optimizers:
-    fire:
-      max_steps: 1000
-      force_tolerance: 0.01
+methods:
+  - name: velocity_verlet
+    enabled: true
+    steps: 10000
+    warmup_steps: 100
+  - name: fire2
+    enabled: true
+    max_steps: 1000
+    warmup_steps: 0
 
 # Potential parameters
 potential:
@@ -353,16 +359,14 @@ potential:
 
 Results are saved as CSV files in `docs/benchmarks/benchmark_results/`:
 
-- `dynamics_md_single_nvalchemiops_<gpu_sku>.csv`
-- `dynamics_md_batch_nvalchemiops_<gpu_sku>.csv`
-- `dynamics_opt_single_nvalchemiops_<gpu_sku>.csv`
-- `dynamics_opt_batch_nvalchemiops_<gpu_sku>.csv`
+- `dyn-lj-system-size-scaling.csv`
+- `dyn-lj-constant-workload-scaling.csv`
+- `dyn-lj-batch-scaling.csv`
 - `fire_compare_<gpu_sku>.csv`
 - `fire2_kernel_benchmark_<gpu_sku>.csv`
 
-Generate plots with:
+Generate plots from an existing results directory with:
 
 ```bash
-cd docs/benchmarks
-python generate_plots.py
+python -m benchmarks.benchmark_suite --plot-only docs/benchmarks/benchmark_results
 ```

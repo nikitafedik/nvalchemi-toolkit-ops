@@ -479,7 +479,7 @@ cost for force-only usage.
 | --------- | ----- |
 | Accuracies | $10^{-4}$ / $10^{-6}$ |
 | Methods | PME, Ewald summation |
-| System Type | CsCl supercells (pymatgen), NH₃ (PDB) |
+| System Type | CsCl programmatic supercells, NH₃ (PDB) |
 | Neighbor List | Naive algorithm ($O(N^2)$ scaling) — EL dispatches through ``batch_naive_neighbor_list`` |
 | Warmup Iterations | 10 |
 | Timing Iterations | 20 |
@@ -500,7 +500,7 @@ Parameters are automatically estimated using accuracy-based parameter estimation
 ## Running Your Own Benchmarks
 
 Run from the repository root. The YAML config already enables both PME
-and Ewald; pass ``--methods pme`` or ``--methods ewald`` to benchmark
+and Ewald; pass ``--method pme`` or ``--method ewald`` to benchmark
 only one.
 
 ### Torch Backend (default)
@@ -531,7 +531,7 @@ runs are:
 : Computational backend (default: whatever ``config['runtime']['backend']``
   is set to, else ``torch``).
 
-`--methods {pme,ewald} [{pme,ewald} ...]`
+`--method {pme,ewald} [{pme,ewald} ...]`
 : Restrict to a subset of methods. Default: run every method marked
   ``enabled: true`` in the YAML (PME + Ewald ship enabled).
 

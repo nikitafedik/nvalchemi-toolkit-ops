@@ -1,6 +1,19 @@
 #!/usr/bin/env python3
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2025 - 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 """Neighbor List Benchmark.
 
 Benchmarks naive O(N²) and cell-list O(N) neighbor list construction
@@ -17,7 +30,7 @@ Usage (run from the repository root):
         --config benchmarks/neighborlist/benchmark_config.yaml \
         --output-dir docs/benchmarks/benchmark_results
 
-    # JAX backend
+    # JAX backend (the runner also sets this defensively before importing JAX)
     XLA_PYTHON_CLIENT_PREALLOCATE=false \
         python -m benchmarks.neighborlist.benchmark_neighborlist \
         --config benchmarks/neighborlist/benchmark_config.yaml --backend jax
@@ -31,7 +44,8 @@ events for timing. ``--backend jax`` uses the JAX wrappers in
 
 Environment variables for ``--backend jax``:
 
-- ``XLA_PYTHON_CLIENT_PREALLOCATE=false`` — required, or XLA grabs all VRAM.
+- ``XLA_PYTHON_CLIENT_PREALLOCATE=false`` — set by the runner before importing
+  JAX; exporting it explicitly is also safe.
 - ``JAX_ENABLE_X64=True`` — optional (electrostatics is the only benchmark
   that hard-requires this).
 """
@@ -53,17 +67,23 @@ __all__ = [
 
 from benchmarks.config import (
     add_common_cli_args,
+    enabled_method_names,
     load_yaml_config,
     merge_common_cli_overrides,
+    normalize_method_name,
 )
 from benchmarks.constants import DEFAULT_ATOMIC_DENSITY, DEFAULT_NL_SAFETY_FACTOR
 from benchmarks.systems import (
     configs_for_mode,
     create_system,
+    filter_configs_by_total_atoms,
+    planned_atom_counts,
     resolve_nh3_dir,
 )
 from benchmarks.utils import (
+    build_failure_result,
     build_result,
+    build_skipped_result,
     clean_gpu,
     create_run_directory,
     cuda_timed_runs,
@@ -76,6 +96,7 @@ from benchmarks.utils import (
     measure_memory_jax,
     measure_memory_torch,
     save_results,
+    sync_gpu,
 )
 
 # Official nvalchemiops public APIs used by the neighbor-list runner.
@@ -83,22 +104,72 @@ from nvalchemiops.neighbors import estimate_max_neighbors
 from nvalchemiops.torch.neighbors import (
     batch_cell_list,
     batch_naive_neighbor_list,
+    cell_list,
+    naive_neighbor_list,
 )
+
+_SUPPORTED_NL_METHODS = {
+    "cell_list",
+    "batch_cell_list",
+    "naive_neighbor_list",
+    "batch_naive_neighbor_list",
+}
 
 
 def merge_cli_overrides(config: dict, args: argparse.Namespace) -> dict:
     """Apply CLI overrides on top of YAML config.
 
     Common flags are merged by :func:`merge_common_cli_overrides`; this
-    wrapper adds the NL-specific ``--cutoffs`` and ``--methods`` handling.
+    wrapper adds the NL-specific ``--cutoffs`` handling.
     """
     config = merge_common_cli_overrides(config, args)
     if args.cutoffs is not None:
         config["parameters"]["cutoffs"] = args.cutoffs
-    if args.methods is not None:
-        for method in config["methods"]:
-            method["enabled"] = method["name"] in args.methods
     return config
+
+
+def _nl_supported_methods(methods: list[str]) -> tuple[list[str], list[str]]:
+    """Split requested method names into NL-supported and ignored tokens."""
+    supported = []
+    ignored = []
+    for method in methods:
+        method = normalize_method_name(method)
+        if method in _SUPPORTED_NL_METHODS:
+            supported.append(method)
+        else:
+            ignored.append(method)
+    return supported, ignored
+
+
+def _nl_method_for_case(method: str, batch_size: int, explicit: bool) -> str | None:
+    """Resolve a configured NL method to the concrete API for this batch shape."""
+    method = normalize_method_name(method)
+    if explicit:
+        is_batch = method.startswith("batch_")
+        if batch_size == 1 or is_batch:
+            return method
+        return None
+    if batch_size == 1:
+        return method.removeprefix("batch_")
+    if method.startswith("batch_"):
+        return method
+    if method == "cell_list":
+        return "batch_cell_list"
+    if method == "naive_neighbor_list":
+        return "batch_naive_neighbor_list"
+    return method
+
+
+def _resolved_methods_for_case(
+    methods: list[str], batch_size: int, explicit: bool
+) -> list[str]:
+    """Resolve and de-duplicate method names for one concrete NL case."""
+    resolved = []
+    for method in methods:
+        concrete = _nl_method_for_case(method, batch_size, explicit)
+        if concrete is not None and concrete not in resolved:
+            resolved.append(concrete)
+    return resolved
 
 
 # =============================================================================
@@ -128,7 +199,7 @@ def benchmark_nl(
     cutoff : float
         Cutoff distance in Angstroms.
     method : str
-        'naive' or 'cell'.
+        Public neighborlist API name.
     num_runs : int
         Number of timing iterations.
     warmup_runs : int
@@ -141,13 +212,17 @@ def benchmark_nl(
     dict
         Timing and memory results with NL-specific extras.
     """
+    method = normalize_method_name(method)
     if backend == "jax":
         return _benchmark_nl_jax(data, cutoff, method, num_runs, warmup_runs)
+    if backend == "warp":
+        return _benchmark_nl_warp(data, cutoff, method, num_runs, warmup_runs)
 
     positions = data["positions"]
     cell = data["cell"]
     pbc = data["pbc"]
     batch_idx = data["batch_idx"]
+    batch_size = int(data.get("batch_size", 1))
     total_atoms = data.get("total_atoms", data["atoms_per_system"])
 
     maxnb = estimate_max_neighbors(
@@ -155,17 +230,44 @@ def benchmark_nl(
         atomic_density=DEFAULT_ATOMIC_DENSITY,
         safety_factor=DEFAULT_NL_SAFETY_FACTOR,
     )
-    nl_func = batch_cell_list if method == "cell" else batch_naive_neighbor_list
 
     def run_nl():
-        return nl_func(
-            positions=positions,
-            cell=cell,
-            pbc=pbc,
-            cutoff=cutoff,
-            batch_idx=batch_idx,
-            max_neighbors=maxnb,
-        )
+        if method == "cell_list":
+            return cell_list(
+                positions=positions,
+                cell=cell,
+                pbc=pbc,
+                cutoff=cutoff,
+                max_neighbors=maxnb,
+            )
+        if method == "naive_neighbor_list":
+            return naive_neighbor_list(
+                positions=positions,
+                cell=cell,
+                pbc=pbc,
+                cutoff=cutoff,
+                max_neighbors=maxnb,
+            )
+        if method == "batch_cell_list":
+            return batch_cell_list(
+                positions=positions,
+                cell=cell,
+                pbc=pbc,
+                cutoff=cutoff,
+                batch_idx=batch_idx,
+                max_neighbors=maxnb,
+            )
+        if method == "batch_naive_neighbor_list":
+            return batch_naive_neighbor_list(
+                positions=positions,
+                cell=cell,
+                pbc=pbc,
+                cutoff=cutoff,
+                batch_idx=batch_idx,
+                max_neighbors=maxnb,
+                max_atoms_per_system=int(total_atoms // batch_size),
+            )
+        raise ValueError(f"Unsupported NL method for torch backend: {method}")
 
     # Single warmup run: captures neighbor count + peak memory
     result, mem_info = measure_memory_torch(run_nl)
@@ -205,17 +307,19 @@ def _benchmark_nl_jax(data, cutoff, method, num_runs, warmup_runs):
     batch_size = int(data.get("batch_size", 1))
     total_atoms = data.get("total_atoms", atoms_per_system)
 
-    # Under jax.jit the NL wrapper cannot infer num_systems from
-    # batch_idx.max() or allocate shape-dependent buffers from traced
-    # cell geometry. Compute batch_ptr and the cell-list / naive sizing
-    # once outside the timed closure; the library's own helpers
-    # (estimate_batch_cell_list_sizes, compute_naive_num_shifts) are
-    # designed to be called here.
+    # Under jax.jit the batched NL wrappers need static batch pointers
+    # and precomputed sizing metadata.
     batch_ptr = jnp.arange(batch_size + 1, dtype=jnp.int32) * atoms_per_system
 
-    # We always pass a batch_idx, so always use the batched variants. The
-    # wrapper's auto-prefix rule only fires when ``method=None``.
-    jax_method = "batch_cell_list" if method == "cell" else "batch_naive"
+    jax_method = {
+        "cell_list": "cell_list",
+        "naive_neighbor_list": "naive",
+        "batch_cell_list": "batch_cell_list",
+        "batch_naive_neighbor_list": "batch_naive",
+    }.get(method)
+    if jax_method is None:
+        raise ValueError(f"Unsupported NL method for jax backend: {method}")
+    is_batch_method = method.startswith("batch_")
 
     maxnb = estimate_max_neighbors(
         cutoff,
@@ -224,7 +328,16 @@ def _benchmark_nl_jax(data, cutoff, method, num_runs, warmup_runs):
     )
 
     # Pre-compute sizing outside jit so the closure can be traced.
-    if jax_method == "batch_cell_list":
+    if jax_method == "cell_list":
+        max_total_cells, _, _ = estimate_bcl_sizes(
+            positions=positions,
+            batch_ptr=jnp.asarray([0, atoms_per_system], dtype=jnp.int32),
+            cell=cell,
+            cutoff=float(cutoff),
+            pbc=pbc,
+        )
+        nl_kwargs = dict(max_total_cells=int(max_total_cells))
+    elif jax_method == "batch_cell_list":
         max_total_cells, _, _ = estimate_bcl_sizes(
             positions=positions,
             batch_ptr=batch_ptr,
@@ -241,21 +354,25 @@ def _benchmark_nl_jax(data, cutoff, method, num_runs, warmup_runs):
             shift_range_per_dimension=shift_range,
             num_shifts_per_system=num_shifts,
             max_shifts_per_system=int(max_shifts),
-            max_atoms_per_system=atoms_per_system,
         )
+        if jax_method == "batch_naive":
+            nl_kwargs["max_atoms_per_system"] = atoms_per_system
 
     def run_nl():
-        return jax_nl(
+        kwargs = dict(
             positions=positions,
             cutoff=float(cutoff),
             cell=cell,
             pbc=pbc,
-            batch_idx=batch_idx,
-            batch_ptr=batch_ptr,
             method=jax_method,
             return_neighbor_list=False,
             max_neighbors=int(maxnb),
             **nl_kwargs,
+        )
+        if is_batch_method:
+            kwargs.update(batch_idx=batch_idx, batch_ptr=batch_ptr)
+        return jax_nl(
+            **kwargs,
         )
 
     # jit so the timed loop reflects steady-state per-call cost (the
@@ -278,24 +395,324 @@ def _benchmark_nl_jax(data, cutoff, method, num_runs, warmup_runs):
     }
 
 
+def _benchmark_nl_warp(data, cutoff, method, num_runs, warmup_runs):
+    """Benchmark root Warp neighbor-list launchers through preallocated buffers."""
+    import warp as wp
+
+    from nvalchemiops.neighbors import (
+        batch_build_cell_list as wp_batch_build_cell_list,
+    )
+    from nvalchemiops.neighbors import (
+        batch_naive_neighbor_matrix_pbc,
+        naive_neighbor_matrix_pbc,
+    )
+    from nvalchemiops.neighbors import (
+        batch_query_cell_list as wp_batch_query_cell_list,
+    )
+    from nvalchemiops.neighbors import (
+        build_cell_list as wp_build_cell_list,
+    )
+    from nvalchemiops.neighbors import (
+        query_cell_list as wp_query_cell_list,
+    )
+    from nvalchemiops.torch.neighbors.batch_cell_list import (
+        estimate_batch_cell_list_sizes,
+    )
+    from nvalchemiops.torch.neighbors.cell_list import estimate_cell_list_sizes
+    from nvalchemiops.torch.neighbors.neighbor_utils import (
+        allocate_cell_list,
+        compute_naive_num_shifts,
+        prepare_batch_idx_ptr,
+    )
+    from nvalchemiops.torch.types import (
+        get_wp_dtype,
+        get_wp_mat_dtype,
+        get_wp_vec_dtype,
+    )
+
+    positions = data["positions"]
+    cell = data["cell"]
+    pbc = data["pbc"]
+    batch_idx = data["batch_idx"]
+    batch_size = int(data.get("batch_size", 1))
+    total_atoms = int(data.get("total_atoms", data["atoms_per_system"]))
+    device = positions.device
+    wp_device = str(device)
+    wp_dtype = get_wp_dtype(positions.dtype)
+    wp_vec_dtype = get_wp_vec_dtype(positions.dtype)
+    wp_mat_dtype = get_wp_mat_dtype(positions.dtype)
+    maxnb = estimate_max_neighbors(
+        cutoff,
+        atomic_density=DEFAULT_ATOMIC_DENSITY,
+        safety_factor=DEFAULT_NL_SAFETY_FACTOR,
+    )
+
+    neighbor_matrix = torch.empty(
+        (total_atoms, maxnb), dtype=torch.int32, device=device
+    )
+    neighbor_matrix_shifts = torch.empty(
+        (total_atoms, maxnb, 3), dtype=torch.int32, device=device
+    )
+    num_neighbors = torch.empty((total_atoms,), dtype=torch.int32, device=device)
+    wp_positions = wp.from_torch(positions, dtype=wp_vec_dtype, return_ctype=True)
+    wp_cell = wp.from_torch(cell, dtype=wp_mat_dtype, return_ctype=True)
+    wp_pbc = wp.from_torch(pbc, dtype=wp.bool, return_ctype=True)
+    wp_neighbor_matrix = wp.from_torch(
+        neighbor_matrix, dtype=wp.int32, return_ctype=True
+    )
+    wp_neighbor_matrix_shifts = wp.from_torch(
+        neighbor_matrix_shifts, dtype=wp.vec3i, return_ctype=True
+    )
+    wp_num_neighbors = wp.from_torch(num_neighbors, dtype=wp.int32, return_ctype=True)
+
+    def zero_outputs() -> None:
+        neighbor_matrix.fill_(total_atoms)
+        neighbor_matrix_shifts.zero_()
+        num_neighbors.zero_()
+
+    if method == "naive_neighbor_list":
+        shift_range, num_shifts, _ = compute_naive_num_shifts(cell, cutoff, pbc)
+        wp_shift_range = wp.from_torch(shift_range, dtype=wp.vec3i, return_ctype=True)
+
+        def run_nl():
+            zero_outputs()
+            naive_neighbor_matrix_pbc(
+                wp_positions,
+                cutoff,
+                wp_cell,
+                wp_shift_range,
+                int(num_shifts[0].item()),
+                wp_neighbor_matrix,
+                wp_neighbor_matrix_shifts,
+                wp_num_neighbors,
+                wp_dtype,
+                wp_device,
+            )
+
+    elif method == "batch_naive_neighbor_list":
+        batch_idx, batch_ptr = prepare_batch_idx_ptr(
+            batch_idx, None, total_atoms, device
+        )
+        shift_range, num_shifts, max_shifts = compute_naive_num_shifts(
+            cell, cutoff, pbc
+        )
+        wp_batch_idx = wp.from_torch(batch_idx, dtype=wp.int32, return_ctype=True)
+        wp_batch_ptr = wp.from_torch(batch_ptr, dtype=wp.int32, return_ctype=True)
+        wp_shift_range = wp.from_torch(shift_range, dtype=wp.vec3i, return_ctype=True)
+        wp_num_shifts = wp.from_torch(num_shifts, dtype=wp.int32, return_ctype=True)
+
+        def run_nl():
+            zero_outputs()
+            batch_naive_neighbor_matrix_pbc(
+                wp_positions,
+                wp_cell,
+                cutoff,
+                wp_batch_ptr,
+                wp_batch_idx,
+                wp_shift_range,
+                wp_num_shifts,
+                max_shifts,
+                wp_neighbor_matrix,
+                wp_neighbor_matrix_shifts,
+                wp_num_neighbors,
+                wp_dtype,
+                wp_device,
+                int(data["atoms_per_system"]),
+            )
+
+    elif method == "cell_list":
+        wp_pbc_single = wp.from_torch(pbc.squeeze(0), dtype=wp.bool, return_ctype=True)
+        max_total_cells, neighbor_search_radius = estimate_cell_list_sizes(
+            cell, pbc, cutoff
+        )
+        cell_cache = allocate_cell_list(
+            total_atoms, max_total_cells, neighbor_search_radius, device
+        )
+        (
+            cells_per_dimension,
+            neighbor_search_radius,
+            atom_periodic_shifts,
+            atom_to_cell_mapping,
+            atoms_per_cell_count,
+            cell_atom_start_indices,
+            cell_atom_list,
+        ) = cell_cache
+        wp_cells_per_dimension = wp.from_torch(
+            cells_per_dimension, dtype=wp.int32, return_ctype=True
+        )
+        wp_neighbor_search_radius = wp.from_torch(
+            neighbor_search_radius, dtype=wp.int32, return_ctype=True
+        )
+        wp_atom_periodic_shifts = wp.from_torch(
+            atom_periodic_shifts, dtype=wp.vec3i, return_ctype=True
+        )
+        wp_atom_to_cell_mapping = wp.from_torch(
+            atom_to_cell_mapping, dtype=wp.vec3i, return_ctype=True
+        )
+        wp_atoms_per_cell_count = wp.from_torch(atoms_per_cell_count, dtype=wp.int32)
+        wp_cell_atom_start_indices = wp.from_torch(
+            cell_atom_start_indices, dtype=wp.int32
+        )
+        wp_cell_atom_list = wp.from_torch(
+            cell_atom_list, dtype=wp.int32, return_ctype=True
+        )
+
+        def run_nl():
+            zero_outputs()
+            for tensor in cell_cache:
+                tensor.zero_()
+            wp_build_cell_list(
+                wp_positions,
+                wp_cell,
+                wp_pbc_single,
+                cutoff,
+                wp_cells_per_dimension,
+                wp_atom_periodic_shifts,
+                wp_atom_to_cell_mapping,
+                wp_atoms_per_cell_count,
+                wp_cell_atom_start_indices,
+                wp_cell_atom_list,
+                wp_dtype,
+                wp_device,
+            )
+            wp_query_cell_list(
+                wp_positions,
+                wp_cell,
+                wp_pbc_single,
+                cutoff,
+                wp_cells_per_dimension,
+                wp_neighbor_search_radius,
+                wp_atom_periodic_shifts,
+                wp_atom_to_cell_mapping,
+                wp.from_torch(atoms_per_cell_count, dtype=wp.int32, return_ctype=True),
+                wp.from_torch(
+                    cell_atom_start_indices, dtype=wp.int32, return_ctype=True
+                ),
+                wp_cell_atom_list,
+                wp_neighbor_matrix,
+                wp_neighbor_matrix_shifts,
+                wp_num_neighbors,
+                wp_dtype,
+                wp_device,
+            )
+
+    elif method == "batch_cell_list":
+        max_total_cells, neighbor_search_radius = estimate_batch_cell_list_sizes(
+            cell, pbc, cutoff
+        )
+        cell_cache = allocate_cell_list(
+            total_atoms, max_total_cells, neighbor_search_radius, device
+        )
+        (
+            cells_per_dimension,
+            neighbor_search_radius,
+            atom_periodic_shifts,
+            atom_to_cell_mapping,
+            atoms_per_cell_count,
+            cell_atom_start_indices,
+            cell_atom_list,
+        ) = cell_cache
+        cell_offsets = torch.zeros((batch_size,), dtype=torch.int32, device=device)
+        cells_per_system = torch.zeros((batch_size,), dtype=torch.int32, device=device)
+        wp_batch_idx = wp.from_torch(batch_idx, dtype=wp.int32, return_ctype=True)
+        wp_cells_per_dimension = wp.from_torch(
+            cells_per_dimension, dtype=wp.vec3i, return_ctype=True
+        )
+        wp_neighbor_search_radius = wp.from_torch(
+            neighbor_search_radius, dtype=wp.vec3i, return_ctype=True
+        )
+        wp_cell_offsets = wp.from_torch(cell_offsets, dtype=wp.int32)
+        wp_cells_per_system = wp.from_torch(cells_per_system, dtype=wp.int32)
+        wp_atom_periodic_shifts = wp.from_torch(
+            atom_periodic_shifts, dtype=wp.vec3i, return_ctype=True
+        )
+        wp_atom_to_cell_mapping = wp.from_torch(
+            atom_to_cell_mapping, dtype=wp.vec3i, return_ctype=True
+        )
+        wp_atoms_per_cell_count = wp.from_torch(atoms_per_cell_count, dtype=wp.int32)
+        wp_cell_atom_start_indices = wp.from_torch(
+            cell_atom_start_indices, dtype=wp.int32
+        )
+        wp_cell_atom_list = wp.from_torch(
+            cell_atom_list, dtype=wp.int32, return_ctype=True
+        )
+
+        def run_nl():
+            zero_outputs()
+            for tensor in (*cell_cache, cell_offsets, cells_per_system):
+                tensor.zero_()
+            wp_batch_build_cell_list(
+                wp_positions,
+                wp_cell,
+                wp_pbc,
+                cutoff,
+                wp_batch_idx,
+                wp_cells_per_dimension,
+                wp_cell_offsets,
+                wp_cells_per_system,
+                wp_atom_periodic_shifts,
+                wp_atom_to_cell_mapping,
+                wp_atoms_per_cell_count,
+                wp_cell_atom_start_indices,
+                wp_cell_atom_list,
+                wp_dtype,
+                wp_device,
+            )
+            cells_per_system_counts = cells_per_dimension.prod(dim=1)
+            cell_offsets.zero_()
+            if batch_size > 1:
+                torch.cumsum(cells_per_system_counts[:-1], dim=0, out=cell_offsets[1:])
+            wp_batch_query_cell_list(
+                wp_positions,
+                wp_cell,
+                wp_pbc,
+                cutoff,
+                wp_batch_idx,
+                wp_cells_per_dimension,
+                wp_neighbor_search_radius,
+                wp.from_torch(cell_offsets, dtype=wp.int32, return_ctype=True),
+                wp_atom_periodic_shifts,
+                wp_atom_to_cell_mapping,
+                wp.from_torch(atoms_per_cell_count, dtype=wp.int32, return_ctype=True),
+                wp.from_torch(
+                    cell_atom_start_indices, dtype=wp.int32, return_ctype=True
+                ),
+                wp_cell_atom_list,
+                wp_neighbor_matrix,
+                wp_neighbor_matrix_shifts,
+                wp_num_neighbors,
+                wp_dtype,
+                wp_device,
+            )
+
+    else:
+        raise ValueError(f"Unsupported NL method for warp backend: {method}")
+
+    _, mem_info = measure_memory_torch(run_nl)
+    n_neighbors = int(num_neighbors.max().item()) if total_atoms else 0
+    time_sec = cuda_timed_runs(run_nl, num_runs, warmup_runs=warmup_runs)
+    sync_gpu()
+    return {
+        "time_seconds": time_sec,
+        "mem_info": mem_info,
+        "max_neighbors": n_neighbors,
+        "total_neighbor_pairs": int(num_neighbors.sum().item()) if total_atoms else 0,
+    }
+
+
 # =============================================================================
 # Config-Driven Runner
 # =============================================================================
 
 
-def _nl_run_one_method(
-    data, cutoff, method, num_runs, warmup_runs, backend, row_meta
-):
+def _nl_run_one_method(data, cutoff, method, num_runs, warmup_runs, backend, row_meta):
     """Run :func:`benchmark_nl` for one ``(cutoff, method)`` and build a result row.
 
-    Catches OOM (prints, clean_gpu, returns None) and other exceptions
-    (prints, returns None). Keeps the inner loop in :func:`run_from_config`
-    free of try/except nesting.
+    Catches OOM and other exceptions and emits ``success=False`` rows.
+    Keeps the inner loop in :func:`run_from_config` free of try/except nesting.
     """
     try:
-        r = benchmark_nl(
-            data, cutoff, method, num_runs, warmup_runs, backend=backend
-        )
+        r = benchmark_nl(data, cutoff, method, num_runs, warmup_runs, backend=backend)
         result = build_result(
             method=method,
             time_seconds=r["time_seconds"],
@@ -305,21 +722,123 @@ def _nl_run_one_method(
         )
         throughput_matoms = result["throughput_atoms_per_sec"] / 1e6
         mem_suffix = (
-            f" | {result['mem_delta_mb']:.1f} MB" if backend == "torch" else ""
+            f" | {result['mem_delta_mb']:.1f} MB"
+            if backend in {"torch", "warp"}
+            else ""
         )
         print(
-            f"    {cutoff}Å {method:5s}: "
+            f"    {cutoff}Å {method}: "
             f"{result['time_us_per_atom']:.3f} μs/atom | "
             f"{throughput_matoms:.1f} Matom/s{mem_suffix}"
         )
         return result
-    except torch.cuda.OutOfMemoryError:
-        print(f"    {cutoff}Å {method:5s}: OOM")
+    except torch.cuda.OutOfMemoryError as e:
+        print(f"    {cutoff}Å {method}: OOM")
         clean_gpu()
-        return None
+        return build_failure_result(
+            method=method,
+            cutoff=cutoff,
+            error=str(e),
+            error_type=type(e).__name__,
+            **row_meta,
+        )
     except Exception as e:
-        print(f"    {cutoff}Å {method:5s}: FAILED - {e}")
-        return None
+        print(f"    {cutoff}Å {method}: FAILED - {e}")
+        return build_failure_result(
+            method=method,
+            cutoff=cutoff,
+            error=str(e),
+            error_type=type(e).__name__,
+            **row_meta,
+        )
+
+
+def dry_run_from_config(config: dict, backend: str | None = None) -> list[dict]:
+    """Print and return the expanded NL benchmark plan without allocation."""
+    params = config["parameters"]
+    cutoffs = params["cutoffs"]
+    cutoff_limits = params.get("cutoff_limits", {})
+    max_total_atoms = params.get("max_total_atoms")
+    if backend is None:
+        backend = config.get("runtime", {}).get("backend", "torch")
+    methods, ignored_methods = _nl_supported_methods(enabled_method_names(config))
+    if ignored_methods:
+        print(f"NL dry-run ignoring non-NL methods: {', '.join(ignored_methods)}")
+    explicit = bool(config.get("runtime", {}).get("explicit_methods", False))
+    rows = []
+    for sys_name, sys_config in config["systems"].items():
+        if not sys_config.get("enabled", True):
+            continue
+        nh3_dir = resolve_nh3_dir(sys_config)
+        for mode_name, mode_config in config["scaling"].items():
+            if not isinstance(mode_config, dict) or not mode_config.get(
+                "enabled", True
+            ):
+                continue
+            configs = configs_for_mode(
+                mode_name, mode_config, sys_name, sys_config, nh3_dir
+            )
+            configs, skipped = filter_configs_by_total_atoms(
+                configs, sys_name, max_total_atoms
+            )
+            for cfg, total_atoms in skipped:
+                atoms_per_system, batch_size, _ = planned_atom_counts(sys_name, cfg)
+                resolved_methods = _resolved_methods_for_case(
+                    methods, batch_size, explicit
+                )
+                rows.extend(
+                    {
+                        "benchmark": "nl",
+                        "backend": backend,
+                        "system": sys_name,
+                        "mode": mode_name,
+                        "atoms_per_system": atoms_per_system,
+                        "batch_size": batch_size,
+                        "total_atoms": total_atoms,
+                        "method": method,
+                        "cutoff": cutoff,
+                        "reason": f">{max_total_atoms} max_total_atoms",
+                    }
+                    for cutoff in cutoffs
+                    for method in resolved_methods
+                )
+            for cfg in configs:
+                atoms_per_system, batch_size, total_atoms = planned_atom_counts(
+                    sys_name, cfg
+                )
+                resolved_methods = _resolved_methods_for_case(
+                    methods, batch_size, explicit
+                )
+                for cutoff in cutoffs:
+                    limit = cutoff_limits.get(cutoff) or cutoff_limits.get(str(cutoff))
+                    for method in resolved_methods:
+                        reason = ""
+                        if limit and total_atoms > limit:
+                            reason = f">{limit} cutoff_limit"
+                        rows.append(
+                            {
+                                "benchmark": "nl",
+                                "backend": backend,
+                                "system": sys_name,
+                                "mode": mode_name,
+                                "atoms_per_system": atoms_per_system,
+                                "batch_size": batch_size,
+                                "total_atoms": total_atoms,
+                                "method": method,
+                                "cutoff": cutoff,
+                                "reason": reason,
+                            }
+                        )
+    print("NL dry-run plan")
+    for row in rows:
+        suffix = f" SKIP {row['reason']}" if row["reason"] else ""
+        print(
+            "  {system}/{mode} backend={backend} method={method} "
+            "N={atoms_per_system} batch={batch_size} total={total_atoms} "
+            "cutoff={cutoff}{suffix}".format(**row, suffix=suffix)
+        )
+    print(f"NL dry-run rows: {len(rows)}")
+    return rows
 
 
 def run_from_config(
@@ -352,9 +871,13 @@ def run_from_config(
     warmup_runs = params["warmup_runs"]
     cutoffs = params["cutoffs"]
     cutoff_limits = params.get("cutoff_limits", {})
+    max_total_atoms = params.get("max_total_atoms")
 
     if backend is None:
         backend = config.get("runtime", {}).get("backend", "torch")
+
+    if config.get("runtime", {}).get("dry_run", False):
+        return dry_run_from_config(config, backend=backend)
 
     # Resolve output directory
     if output_dir is None:
@@ -363,7 +886,10 @@ def run_from_config(
     output_dir.mkdir(parents=True, exist_ok=True)
 
     # Collect enabled methods
-    methods = [m["name"] for m in config.get("methods", []) if m.get("enabled", True)]
+    methods, ignored_methods = _nl_supported_methods(enabled_method_names(config))
+    if ignored_methods:
+        print(f"NL ignoring non-NL methods: {', '.join(ignored_methods)}")
+    explicit_methods = bool(config.get("runtime", {}).get("explicit_methods", False))
 
     # Eagerly validate JAX availability so the error surfaces now, not
     # partway through the benchmark loop below.
@@ -403,10 +929,46 @@ def run_from_config(
             configs = configs_for_mode(
                 mode_name, mode_config, sys_name, sys_config, nh3_dir
             )
-            if not configs:
-                continue
-
+            configs, skipped = filter_configs_by_total_atoms(
+                configs, sys_name, max_total_atoms
+            )
             results = []
+            for cfg, skipped_total in skipped:
+                print(
+                    f"  SKIP total atoms {format_num(skipped_total)} "
+                    f"(>{format_num(max_total_atoms)})"
+                )
+                atoms_per_system, batch_size, total_atoms = planned_atom_counts(
+                    sys_name, cfg
+                )
+                row_meta = make_row_meta(
+                    sys_name,
+                    mode_name,
+                    backend,
+                    atoms_per_system,
+                    batch_size,
+                    total_atoms,
+                )
+                resolved_methods = _resolved_methods_for_case(
+                    methods, batch_size, explicit_methods
+                )
+                reason = f">{max_total_atoms} max_total_atoms"
+                results.extend(
+                    build_skipped_result(
+                        method=method,
+                        cutoff=cutoff,
+                        reason=reason,
+                        **row_meta,
+                    )
+                    for cutoff in cutoffs
+                    for method in resolved_methods
+                )
+            if not configs:
+                if results:
+                    csv_name = make_csv_name("nl", sys_name, mode_name)
+                    save_results(results, output_dir / csv_name)
+                    all_results.extend(results)
+                continue
 
             for cfg in configs:
                 n, bs = cfg["num_atoms"], cfg["batch_size"]
@@ -419,7 +981,7 @@ def run_from_config(
                         num_atoms=n,
                         pdb_path=cfg.get("pdb_path"),
                         batch_size=bs,
-                        backend=backend,
+                        backend="torch" if backend == "warp" else backend,
                     )
                 except (FileNotFoundError, RuntimeError, ValueError) as e:
                     print(f"    SKIP: {e}")
@@ -439,11 +1001,26 @@ def run_from_config(
                     data.get("batch_size", 1),
                     actual_total,
                 )
+                resolved_methods = _resolved_methods_for_case(
+                    methods,
+                    int(data.get("batch_size", 1)),
+                    explicit_methods,
+                )
 
                 for cutoff in cutoffs:
                     limit = cutoff_limits.get(cutoff) or cutoff_limits.get(str(cutoff))
                     if limit and actual_total > limit:
                         print(f"    {cutoff}Å: SKIP (>{format_num(limit)} limit)")
+                        reason = f">{limit} cutoff_limit"
+                        results.extend(
+                            build_skipped_result(
+                                method=method,
+                                cutoff=cutoff,
+                                reason=reason,
+                                **row_meta,
+                            )
+                            for method in resolved_methods
+                        )
                         continue
 
                     # Note: cell_size < 2*cutoff violates minimum image convention
@@ -453,7 +1030,7 @@ def run_from_config(
                             f"    {cutoff}Å: WARNING cell {data['cell_size']:.1f}Å < 2×cutoff (benchmarking anyway)"
                         )
 
-                    for method in methods:
+                    for method in resolved_methods:
                         result = _nl_run_one_method(
                             data,
                             cutoff,
@@ -500,7 +1077,7 @@ Examples (run from the repository root):
         --system cscl --mode system_size
     python -m benchmarks.neighborlist.benchmark_neighborlist \\
         --config benchmarks/neighborlist/benchmark_config.yaml \\
-        --cutoffs 6 15 --methods cell
+        --cutoffs 6 15 --method cell_list
     python -m benchmarks.neighborlist.benchmark_neighborlist \\
         --config benchmarks/neighborlist/benchmark_config.yaml \\
         --output-dir docs/benchmarks/benchmark_results
@@ -517,9 +1094,6 @@ Examples (run from the repository root):
         nargs="+",
         default=None,
         help="Override cutoff radii in Angstroms",
-    )
-    parser.add_argument(
-        "--methods", nargs="+", default=None, help="Override NL methods (naive, cell)"
     )
     return parser.parse_args()
 
