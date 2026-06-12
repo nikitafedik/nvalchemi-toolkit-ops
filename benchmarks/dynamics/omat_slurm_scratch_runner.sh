@@ -30,7 +30,7 @@ Environment:
   OMAT_WARMUP_RUNS       Warmup steps/calls override
   OMAT_TIMING_RUNS       Timed steps/calls override
   OMAT_SAMPLING_MODE     E/F/S sampling mode (default: prefix_rollover)
-  OMAT_OUTPUTS           E/F/S outputs (default: energy,forces,stress)
+  OMAT_OUTPUTS           E/F/S outputs override (default: runner default or method alias)
 EOF
 }
 
@@ -77,6 +77,7 @@ required_paths=(
   "benchmark-env"
   "benchmarks/dynamics/benchmark_config_omat_200k.yaml"
   "benchmarks/dynamics/benchmark_omat_efs.py"
+  "benchmarks/dynamics/direct_tensornet.py"
   "benchmarks/dynamics/benchmark_dynamics.py"
   "benchmarks/dynamics/model_stacks.py"
   "benchmarks/omat/omat24_sample.pt"
@@ -121,7 +122,7 @@ case "${bench_mode}" in
     default_methods="mace"
     ;;
   efs)
-    default_targets="1024"
+    default_targets=""
     default_methods="mace tnet"
     ;;
 esac
@@ -133,7 +134,7 @@ export OMAT_TARGET_ATOMS="${OMAT_TARGET_ATOMS:-${default_targets}}"
 export OMAT_WARMUP_RUNS="${OMAT_WARMUP_RUNS:-}"
 export OMAT_TIMING_RUNS="${OMAT_TIMING_RUNS:-}"
 export OMAT_SAMPLING_MODE="${OMAT_SAMPLING_MODE:-prefix_rollover}"
-export OMAT_OUTPUTS="${OMAT_OUTPUTS:-energy,forces,stress}"
+export OMAT_OUTPUTS="${OMAT_OUTPUTS:-}"
 
 cat > "${node_runner}" <<'NODE_RUNNER'
 #!/usr/bin/env bash
@@ -203,8 +204,10 @@ import yaml
 src, dst = sys.argv[1], sys.argv[2]
 with open(src) as handle:
     config = yaml.safe_load(handle)
-targets = [int(item) for item in os.environ["OMAT_TARGET_ATOMS"].split()]
-config["model_stacks"]["systems"]["omat"]["atom_count_targets"] = targets
+target_text = os.environ.get("OMAT_TARGET_ATOMS", "").strip()
+if target_text:
+    targets = [int(item) for item in target_text.split()]
+    config["model_stacks"]["systems"]["omat"]["atom_count_targets"] = targets
 config["model_stacks"]["position_perturbation"] = 0.0
 if "OMAT_MACE_COMPILE_MODEL" in os.environ:
     config["model_stacks"].setdefault("mace", {})["compile_model"] = (
@@ -218,19 +221,26 @@ PY
 cd "${root}"
 if [[ "${bench_mode}" == "efs" ]]; then
   read -r -a methods <<< "${OMAT_METHODS}"
-  read -r -a targets <<< "${OMAT_TARGET_ATOMS}"
   warmup="${OMAT_WARMUP_RUNS:-3}"
-  timing="${OMAT_TIMING_RUNS:-10}"
-  "${venv_dir}/bin/python" "${root}/benchmarks/dynamics/benchmark_omat_efs.py" \
+  timing="${OMAT_TIMING_RUNS:-6}"
+  args=(
+    "${root}/benchmarks/dynamics/benchmark_omat_efs.py"
     --config "${config_run}" \
     --dataset "${dataset}" \
     --output-csv "${out_dir}/omat-efs.csv" \
     --method "${methods[@]}" \
-    --target-atoms "${targets[@]}" \
     --warmup-runs "${warmup}" \
     --timing-runs "${timing}" \
-    --outputs "${OMAT_OUTPUTS}" \
     --sampling-mode "${OMAT_SAMPLING_MODE}"
+  )
+  if [[ -n "${OMAT_TARGET_ATOMS}" ]]; then
+    read -r -a targets <<< "${OMAT_TARGET_ATOMS}"
+    args+=(--target-atoms "${targets[@]}")
+  fi
+  if [[ -n "${OMAT_OUTPUTS}" ]]; then
+    args+=(--outputs "${OMAT_OUTPUTS}")
+  fi
+  "${venv_dir}/bin/python" "${args[@]}"
 else
   read -r -a methods <<< "${OMAT_METHODS}"
   warmup="${OMAT_WARMUP_RUNS:-}"
