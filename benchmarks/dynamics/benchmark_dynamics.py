@@ -38,6 +38,12 @@ from benchmarks.config import (
     merge_common_cli_overrides,
     normalize_method_name,
 )
+from benchmarks.dynamics.model_stacks import (
+    MODEL_STACK_METHOD_FAMILIES,
+    MODEL_STACK_METHODS,
+    planned_model_stack_rows,
+    run_model_stack_case,
+)
 from benchmarks.dynamics.shared_utils import (
     NvalchemiOpsBenchmark,
     create_fcc_argon,
@@ -65,6 +71,7 @@ _METHOD_FAMILY = {
     "nph": "md",
     "fire": "opt",
     "fire2": "opt",
+    **MODEL_STACK_METHOD_FAMILIES,
 }
 _DTYPES = {
     "float32": torch.float32,
@@ -72,9 +79,25 @@ _DTYPES = {
 }
 
 
+def _merge_model_stack_cli_overrides(config: dict, args: argparse.Namespace) -> None:
+    """Apply shared system/mode filters to the model-stack YAML subtree."""
+    stack_config = config.get("model_stacks")
+    if not isinstance(stack_config, dict):
+        return
+    if args.system is not None and "all" not in args.system:
+        for sys_name, sys_config in stack_config.get("systems", {}).items():
+            sys_config["enabled"] = sys_name in args.system
+    if args.mode is not None and "all" not in args.mode:
+        for mode_name, mode_config in stack_config.get("scaling", {}).items():
+            if isinstance(mode_config, dict):
+                mode_config["enabled"] = mode_name in args.mode
+
+
 def merge_cli_overrides(config: dict, args: argparse.Namespace) -> dict:
     """Apply shared CLI overrides to the dynamics benchmark config."""
-    return merge_common_cli_overrides(config, args)
+    config = merge_common_cli_overrides(config, args)
+    _merge_model_stack_cli_overrides(config, args)
+    return config
 
 
 def _validate_backend(backend: str) -> None:
@@ -184,7 +207,9 @@ def _cases_for_mode(
     if mode_name == "batch_scaling":
         atom_counts = mode_config.get(
             "atoms_per_system",
-            system_config.get("batch_atom_counts", system_config.get("atom_counts", [])),
+            system_config.get(
+                "batch_atom_counts", system_config.get("atom_counts", [])
+            ),
         )
         for target_atoms in atom_counts:
             _, atoms_per_system = _actual_fcc_atoms(int(target_atoms))
@@ -204,6 +229,10 @@ def _planned_rows(config: dict, backend: str) -> list[dict[str, Any]]:
     methods, ignored = _enabled_dynamics_methods(config)
     if ignored:
         print(f"Dynamics dry-run ignoring non-dynamics methods: {', '.join(ignored)}")
+    standard_methods = [
+        method for method in methods if method not in MODEL_STACK_METHODS
+    ]
+    model_methods = [method for method in methods if method in MODEL_STACK_METHODS]
 
     params = config.get("parameters", {})
     max_total_atoms = params.get("max_total_atoms")
@@ -212,7 +241,9 @@ def _planned_rows(config: dict, backend: str) -> list[dict[str, Any]]:
         if not system_config.get("enabled", True):
             continue
         for mode_name, mode_config in config.get("scaling", {}).items():
-            if not isinstance(mode_config, dict) or not mode_config.get("enabled", True):
+            if not isinstance(mode_config, dict) or not mode_config.get(
+                "enabled", True
+            ):
                 continue
             for target_atoms, atoms_per_system, batch_size in _cases_for_mode(
                 system_config, mode_name, mode_config
@@ -238,8 +269,10 @@ def _planned_rows(config: dict, backend: str) -> list[dict[str, Any]]:
                         "warmup_steps": _method_warmup(config, method),
                         "reason": reason,
                     }
-                    for method in methods
+                    for method in standard_methods
                 )
+    if model_methods:
+        rows.extend(planned_model_stack_rows(config, backend, model_methods))
     return rows
 
 
@@ -275,7 +308,9 @@ def _make_batched_lj_system(
     """Create deterministic batched FCC argon systems."""
     system_cfg = config.get("system", {})
     lattice_constant = float(system_cfg.get("lattice_constant", 5.26))
-    perturbation = float(config.get("parameters", {}).get("position_perturbation", 0.01))
+    perturbation = float(
+        config.get("parameters", {}).get("position_perturbation", 0.01)
+    )
     seed = int(config.get("parameters", {}).get("seed", 42))
     num_cells, atoms_per_system = _actual_fcc_atoms(target_atoms)
     pos_np, cell_np = create_fcc_argon(num_unit_cells=num_cells, a=lattice_constant)
@@ -386,7 +421,9 @@ def _run_method(
     raise ValueError(f"Unsupported dynamics method: {method}")
 
 
-def _result_row(result, plan: dict[str, Any], *, success: bool = True) -> dict[str, Any]:
+def _result_row(
+    result, plan: dict[str, Any], *, success: bool = True
+) -> dict[str, Any]:
     """Normalize a ``BenchmarkResult`` into the unified suite row schema."""
     row = {
         "success": success,
@@ -402,12 +439,13 @@ def _result_row(result, plan: dict[str, Any], *, success: bool = True) -> dict[s
     row.update(result.to_csv_row())
     row["backend"] = plan["backend"]
     row["method"] = plan["method"]
+    row["engine"] = plan.get("engine", "")
+    row["batch_construction"] = plan.get("batch_construction", "")
     row["batch_size"] = plan["batch_size"]
     row["total_atoms"] = plan["total_atoms"]
     if result.avg_step_time_ms:
-        row["time_us_per_atom_step"] = (
-            result.avg_step_time_ms * 1000.0 / max(plan["atoms_per_system"], 1)
-        )
+        timed_atoms = max(plan["total_atoms"], 1)
+        row["time_us_per_atom_step"] = result.avg_step_time_ms * 1000.0 / timed_atoms
     else:
         row["time_us_per_atom_step"] = math.nan
     return row
@@ -429,6 +467,8 @@ def _failure_row(
         "scaling_mode": plan["scaling_mode"],
         "method": plan["method"],
         "method_family": plan["method_family"],
+        "engine": plan.get("engine", ""),
+        "batch_construction": plan.get("batch_construction", ""),
         "target_atoms": plan["target_atoms"],
         "atoms_per_system": plan["atoms_per_system"],
         "batch_size": plan["batch_size"],
@@ -472,6 +512,7 @@ def run_from_config(
 
     all_results: list[dict] = []
     rows_by_file: dict[str, list[dict]] = {}
+    model_cache: dict[tuple[str, ...], torch.nn.Module | Exception] = {}
     for plan in _planned_rows(config, backend):
         csv_name = make_csv_name("dyn", plan["system"], plan["scaling_mode"])
         if plan["reason"]:
@@ -480,37 +521,47 @@ def run_from_config(
             all_results.append(row)
             continue
 
-        method_cfg = _method_config(config, plan["method"])
         try:
-            positions, cell, pbc, batch_idx, atoms_per_system = _make_batched_lj_system(
-                target_atoms=plan["target_atoms"],
-                batch_size=plan["batch_size"],
-                config=config,
-                device=device,
-                dtype=dtype,
-            )
-            plan = {**plan, "atoms_per_system": atoms_per_system}
-            plan["total_atoms"] = atoms_per_system * plan["batch_size"]
-            bench = NvalchemiOpsBenchmark(
-                positions=positions,
-                cell=cell,
-                pbc=pbc,
-                epsilon=float(potential.get("epsilon", 0.0104)),
-                sigma=float(potential.get("sigma", 3.40)),
-                cutoff=float(potential.get("cutoff", 8.5)),
-                skin=float(potential.get("skin", 1.0)),
-                neighbor_rebuild_interval=int(
-                    potential.get("neighbor_rebuild_interval", 10)
-                ),
-                batch_idx=batch_idx,
-            )
-            result = _run_method(
-                bench,
-                plan["method"],
-                method_cfg,
-                plan["steps"],
-                plan["warmup_steps"],
-            )
+            if plan["method"] in MODEL_STACK_METHODS:
+                result = run_model_stack_case(
+                    plan,
+                    config,
+                    model_cache=model_cache,
+                    device=device,
+                )
+            else:
+                method_cfg = _method_config(config, plan["method"])
+                positions, cell, pbc, batch_idx, atoms_per_system = (
+                    _make_batched_lj_system(
+                        target_atoms=plan["target_atoms"],
+                        batch_size=plan["batch_size"],
+                        config=config,
+                        device=device,
+                        dtype=dtype,
+                    )
+                )
+                plan = {**plan, "atoms_per_system": atoms_per_system}
+                plan["total_atoms"] = atoms_per_system * plan["batch_size"]
+                bench = NvalchemiOpsBenchmark(
+                    positions=positions,
+                    cell=cell,
+                    pbc=pbc,
+                    epsilon=float(potential.get("epsilon", 0.0104)),
+                    sigma=float(potential.get("sigma", 3.40)),
+                    cutoff=float(potential.get("cutoff", 8.5)),
+                    skin=float(potential.get("skin", 1.0)),
+                    neighbor_rebuild_interval=int(
+                        potential.get("neighbor_rebuild_interval", 10)
+                    ),
+                    batch_idx=batch_idx,
+                )
+                result = _run_method(
+                    bench,
+                    plan["method"],
+                    method_cfg,
+                    plan["steps"],
+                    plan["warmup_steps"],
+                )
             success = bool(result.step_times) and result.total_time > 0.0
             row = _result_row(result, plan, success=success)
             print(

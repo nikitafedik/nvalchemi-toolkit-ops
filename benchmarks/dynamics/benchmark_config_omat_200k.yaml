@@ -1,0 +1,151 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# OMat 200k-scale model-stack benchmark.
+# Uses OMat systems from omat24_sample.pt and scales total workload by
+# selecting whole-system prefixes with rollover, matching requested atom
+# counts as closely as possible.
+
+parameters:
+  warmup_runs: 10
+  timing_runs: 20
+  max_total_atoms: 200000
+  dtype: "float32"
+  seed: 42
+
+runtime:
+  backend: torch
+
+output:
+  base_dir: benchmarks/benchmark-results
+
+systems: {}
+
+scaling: {}
+
+methods:
+  - name: tnet
+    enabled: true
+    family: model_md
+    steps: 20
+    warmup_steps: 10
+
+  - name: tnet_d3
+    enabled: true
+    family: model_md
+    steps: 20
+    warmup_steps: 10
+
+  - name: mace
+    enabled: true
+    family: model_md
+    steps: 20
+    warmup_steps: 10
+
+  - name: mace_d3
+    enabled: true
+    family: model_md
+    steps: 20
+    warmup_steps: 10
+
+model_stacks:
+  enabled: true
+  dtype: "float32"
+  position_perturbation: 0.0
+
+  integrator:
+    ensemble: nvt
+    dt: 0.25
+    temperature: 300.0
+    friction: 0.01
+    random_seed: 42
+    log_interval: 0
+
+  systems:
+    omat:
+      enabled: true
+      dataset_path: benchmarks/omat/omat24_sample.pt
+      atom_counts: []
+      batch_construction: prefix_rollover
+      atom_count_targets:
+        - 1024
+        - 2048
+        - 5000
+        - 10000
+        - 20000
+        - 30000
+        - 40000
+        - 50000
+        - 60000
+        - 70000
+        - 80000
+        - 90000
+        - 100000
+        - 110000
+        - 120000
+        - 130000
+        - 140000
+        - 150000
+        - 160000
+        - 170000
+        - 180000
+        - 190000
+        - 200000
+      max_systems_per_atom_count: 1
+      constant_atoms_sizes: [192]
+
+  scaling:
+    system_size:
+      enabled: false
+
+    constant_workload:
+      enabled: false
+
+    batch_scaling:
+      enabled: true
+      max_total_atoms: 200000
+      batch_sizes:
+        - 1
+        - 52
+        - 104
+        - 156
+        - 208
+        - 260
+        - 312
+        - 364
+        - 416
+        - 468
+        - 520
+        - 572
+        - 624
+        - 676
+        - 728
+        - 780
+        - 832
+        - 884
+        - 936
+        - 988
+        - 1040
+
+  tensornet:
+    model_name: "TensorNet-PES-MatPES-PBE-2025.2"
+    require_warp: true
+
+  mace:
+    checkpoint: "medium-mpa-0"
+    enable_cueq: true
+    dtype: "float32"
+    compile_model: false
+    compile_kwargs: {}
+
+  d3:
+    cutoff: 15.0
+    a1: 0.4145
+    a2: 4.8593
+    s6: 1.0
+    s8: 1.2177
+    k1: 16.0
+    k3: -4.0
+    smoothing_fraction: 0.2
+    auto_download: true
+    param_file: ~/.cache/nvalchemiops/dftd3_parameters.pt

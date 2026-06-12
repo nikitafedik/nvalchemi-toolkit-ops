@@ -269,6 +269,9 @@ def _plot_3panel(
                 "memory": "Peak Memory (VRAM)",
             }
         ax.set_title(panel_titles[panel], fontsize=TITLE_SIZE)
+        if module == "dyn" and panel == "memory":
+            for text in list(ax.texts):
+                text.remove()
 
     legend_bottom = 0.0
     if module == "dyn":
@@ -1024,6 +1027,18 @@ _DYN_METHOD_LABELS = {
     "nph": "NPH",
     "fire": "FIRE",
     "fire2": "FIRE2",
+    "tnet_d3": "TNet + D3",
+    "mace_d3": "MACE + D3",
+    "mace_d3_pme": "MACE + D3 + PME",
+    "mace_d3_ewald": "MACE + D3 + Ewald",
+    "tnet_d3_fire": "TNet + D3 FIRE",
+    "tnet_d3_fire2": "TNet + D3 FIRE2",
+    "mace_d3_fire": "MACE + D3 FIRE",
+    "mace_d3_fire2": "MACE + D3 FIRE2",
+    "mace_d3_pme_fire": "MACE + D3 + PME FIRE",
+    "mace_d3_pme_fire2": "MACE + D3 + PME FIRE2",
+    "mace_d3_ewald_fire": "MACE + D3 + Ewald FIRE",
+    "mace_d3_ewald_fire2": "MACE + D3 + Ewald FIRE2",
 }
 
 _DYN_METHOD_STYLES = {
@@ -1033,6 +1048,58 @@ _DYN_METHOD_STYLES = {
     "nph": {"color": "#440154", "marker": "D", "linestyle": "-"},
     "fire": {"color": GRAY, "marker": "P", "linestyle": SECONDARY_LINESTYLE},
     "fire2": {"color": "#17BECF", "marker": "X", "linestyle": SECONDARY_LINESTYLE},
+    "tnet_d3": {"color": "#8C564B", "marker": "v", "linestyle": "-"},
+    "mace_d3": {"color": "#9467BD", "marker": "<", "linestyle": "-"},
+    "mace_d3_pme": {
+        "color": "#D62728",
+        "marker": ">",
+        "linestyle": "-",
+    },
+    "mace_d3_ewald": {
+        "color": "#2CA02C",
+        "marker": "h",
+        "linestyle": "--",
+    },
+    "tnet_d3_fire": {
+        "color": "#8C564B",
+        "marker": "P",
+        "linestyle": SECONDARY_LINESTYLE,
+    },
+    "tnet_d3_fire2": {
+        "color": "#8C564B",
+        "marker": "X",
+        "linestyle": "--",
+    },
+    "mace_d3_fire": {
+        "color": "#9467BD",
+        "marker": "P",
+        "linestyle": SECONDARY_LINESTYLE,
+    },
+    "mace_d3_fire2": {
+        "color": "#9467BD",
+        "marker": "X",
+        "linestyle": "--",
+    },
+    "mace_d3_pme_fire": {
+        "color": "#D62728",
+        "marker": "P",
+        "linestyle": SECONDARY_LINESTYLE,
+    },
+    "mace_d3_pme_fire2": {
+        "color": "#D62728",
+        "marker": "X",
+        "linestyle": "--",
+    },
+    "mace_d3_ewald_fire": {
+        "color": "#2CA02C",
+        "marker": "P",
+        "linestyle": SECONDARY_LINESTYLE,
+    },
+    "mace_d3_ewald_fire2": {
+        "color": "#2CA02C",
+        "marker": "X",
+        "linestyle": "--",
+    },
 }
 
 
@@ -1059,7 +1126,7 @@ def _get_dyn_y(row: dict[str, Any], panel: str) -> float | None:
     if panel == "time":
         value = row.get("time_us_per_atom_step")
         if value is None and row.get("avg_step_time_ms") is not None:
-            atoms = max(int(row.get("atoms_per_system", 1)), 1)
+            atoms = max(int(row.get("total_atoms", row.get("atoms_per_system", 1))), 1)
             value = row["avg_step_time_ms"] * 1000.0 / atoms
     elif panel == "throughput":
         value = row.get("throughput_atom_steps_per_s")

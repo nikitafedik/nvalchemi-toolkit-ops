@@ -127,6 +127,244 @@ methods:
     log_interval: 100
     check_interval: 20
 
+  - name: tnet
+    enabled: false
+    family: model_md
+    description: "MatGL TensorNet in NVT Langevin dynamics"
+    steps: 20
+    warmup_steps: 10
+
+  - name: tnet_d3
+    enabled: false
+    family: model_md
+    description: "MatGL TensorNet plus Toolkit DFT-D3 in NVT Langevin dynamics"
+    steps: 20
+    warmup_steps: 10
+
+  - name: mace
+    enabled: false
+    family: model_md
+    description: "MACE cuEq in NVT Langevin dynamics"
+    steps: 20
+    warmup_steps: 10
+
+  - name: mace_d3
+    enabled: false
+    family: model_md
+    description: "MACE cuEq plus Toolkit DFT-D3 in NVT Langevin dynamics"
+    steps: 20
+    warmup_steps: 10
+
+  - name: mace_d3_pme
+    enabled: false
+    family: model_md
+    description: "MACE cuEq plus Toolkit DFT-D3 and PME in NVT Langevin dynamics"
+    steps: 20
+    warmup_steps: 10
+
+  - name: mace_d3_ewald
+    enabled: false
+    family: model_md
+    description: "MACE cuEq plus Toolkit DFT-D3 and direct Ewald in NVT Langevin dynamics"
+    steps: 20
+    warmup_steps: 10
+
+  - name: tnet_fire
+    enabled: false
+    family: model_opt
+    description: "MatGL TensorNet with FIRE optimization"
+    max_steps: 20
+    warmup_steps: 5
+
+  - name: tnet_d3_fire
+    enabled: false
+    family: model_opt
+    description: "MatGL TensorNet plus Toolkit DFT-D3 with FIRE optimization"
+    max_steps: 20
+    warmup_steps: 5
+
+  - name: tnet_fire2
+    enabled: false
+    family: model_opt
+    description: "MatGL TensorNet with FIRE2 optimization"
+    max_steps: 20
+    warmup_steps: 5
+
+  - name: tnet_d3_fire2
+    enabled: false
+    family: model_opt
+    description: "MatGL TensorNet plus Toolkit DFT-D3 with FIRE2 optimization"
+    max_steps: 20
+    warmup_steps: 5
+
+  - name: mace_fire
+    enabled: false
+    family: model_opt
+    description: "MACE cuEq with FIRE optimization"
+    max_steps: 20
+    warmup_steps: 5
+
+  - name: mace_d3_fire
+    enabled: false
+    family: model_opt
+    description: "MACE cuEq plus Toolkit DFT-D3 with FIRE optimization"
+    max_steps: 20
+    warmup_steps: 5
+
+  - name: mace_fire2
+    enabled: false
+    family: model_opt
+    description: "MACE cuEq with FIRE2 optimization"
+    max_steps: 20
+    warmup_steps: 5
+
+  - name: mace_d3_fire2
+    enabled: false
+    family: model_opt
+    description: "MACE cuEq plus Toolkit DFT-D3 with FIRE2 optimization"
+    max_steps: 20
+    warmup_steps: 5
+
+  - name: mace_d3_pme_fire
+    enabled: false
+    family: model_opt
+    description: "MACE cuEq plus Toolkit DFT-D3 and PME with FIRE optimization"
+    max_steps: 20
+    warmup_steps: 5
+
+  - name: mace_d3_pme_fire2
+    enabled: false
+    family: model_opt
+    description: "MACE cuEq plus Toolkit DFT-D3 and PME with FIRE2 optimization"
+    max_steps: 20
+    warmup_steps: 5
+
+  - name: mace_d3_ewald_fire
+    enabled: false
+    family: model_opt
+    description: "MACE cuEq plus Toolkit DFT-D3 and direct Ewald with FIRE optimization"
+    max_steps: 20
+    warmup_steps: 5
+
+  - name: mace_d3_ewald_fire2
+    enabled: false
+    family: model_opt
+    description: "MACE cuEq plus Toolkit DFT-D3 and direct Ewald with FIRE2 optimization"
+    max_steps: 20
+    warmup_steps: 5
+
+# Optional Toolkit model-stack dynamics and optimization benchmarks
+# ------------------------------------------------
+# These methods are disabled by default because they require optional model
+# packages and downloaded foundation-model checkpoints. Select them explicitly
+# with --method tnet_d3, mace_d3_pme_fire, etc.
+model_stacks:
+  enabled: true
+  dtype: "float32"
+  position_perturbation: 0.01
+
+  integrator:
+    ensemble: nvt
+    dt: 0.25
+    temperature: 300.0
+    friction: 0.01
+    random_seed: 42
+    log_interval: 0
+
+  optimizer:
+    steps: 20
+    warmup_steps: 5
+    dt_start: 0.05
+    maxstep: 0.1
+    fire:
+      dt_start: 0.05
+      dt_max: 0.08
+      dt_min: 0.005
+      alpha_start: 0.09
+      n_min: 5
+      f_inc: 1.05
+      f_dec: 0.75
+      f_alpha: 0.985
+      maxstep: 0.1
+    fire2:
+      dt_start: 0.045
+      tmax: 0.08
+      tmin: 0.005
+      delaystep: 5
+      dtgrow: 1.05
+      dtshrink: 0.75
+      alpha0: 0.09
+      alphashrink: 0.985
+      maxstep: 0.1
+
+  systems:
+    cscl:
+      enabled: true
+      atom_counts: [32, 128, 512, 2048]
+      constant_atoms_sizes: [32, 128, 512]
+
+    nh3:
+      enabled: false  # requires generated benchmarks/nh3/ammonia_pbc_*.pdb files
+      pdb_dir: ../../nh3
+      constant_atoms_sizes: [256, 8192]
+
+    omat:
+      enabled: false
+      dataset_path: benchmarks/omat/omat24_sample.pt
+      # Empty atom_counts means all available OMat atom-count buckets.
+      atom_counts: []
+      max_systems_per_atom_count: 1
+      constant_atoms_sizes: []
+
+  scaling:
+    system_size:
+      enabled: true
+      batch_size: 1
+
+    constant_workload:
+      enabled: true
+      target_atoms: 8192
+
+    batch_scaling:
+      enabled: true
+      max_total_atoms: 8192
+
+  tensornet:
+    model_name: "TensorNet-PES-MatPES-PBE-2025.2"
+    require_warp: true
+
+  mace:
+    checkpoint: "medium-mpa-0"
+    enable_cueq: true
+    dtype: "float32"
+    compile_model: false
+    compile_kwargs: {}
+
+  d3:
+    cutoff: 15.0
+    a1: 0.4145
+    a2: 4.8593
+    s6: 1.0
+    s8: 1.2177
+    k1: 16.0
+    k3: -4.0
+    smoothing_fraction: 0.2
+    auto_download: true
+    param_file: ~/.cache/nvalchemiops/dftd3_parameters.pt
+
+  electrostatics:
+    cutoff: 10.0
+    accuracy: 1.0e-4
+    coulomb_constant: 14.3996
+    hybrid_forces: true
+    pme:
+      mesh_spacing: 1.0
+      mesh_dimensions: null
+      spline_order: 4
+      alpha: null
+    ewald:
+      accuracy: 1.0e-4
+
 # Single-System MD Benchmarks
 # ---------------------------
 md_single:

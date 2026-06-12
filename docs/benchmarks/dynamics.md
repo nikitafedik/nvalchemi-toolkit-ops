@@ -14,9 +14,9 @@ and we encourage users to benchmark on their own systems of interest.
 ## How to Read These Charts
 
 Time Scaling
-: Average time per atom-step or per MD/optimization step vs. system size,
-  depending on the plot source. Lower is better. For batched runs, each step
-  processes all systems in the batch.
+: Average time per atom-step vs. system size. Lower is better. For batched
+  runs, the atom count is the total atoms processed across all systems in the
+  batch.
 
 Throughput
 : Atom-steps processed per second. Higher is better. For batched systems, this
@@ -36,17 +36,34 @@ Batch Size
 The primary benchmark entry point is `benchmarks.benchmark_suite`, consistent
 with the neighbor-list, DFT-D3, and electrostatics benchmarks. It reads
 `benchmarks/dynamics/benchmark_config.yaml`, applies shared CLI overrides, writes
-`dyn-lj-<mode>.csv`, and generates the same 3-panel and single-panel PNG layout
-as the other modules.
+`dyn-<system>-<mode>.csv`, and generates the same 3-panel and single-panel PNG
+layout as the other modules. Standard integrator runs use Lennard-Jones argon;
+optional model-stack runs use the charged CsCl systems by default. NH3 can be
+enabled after generating the benchmark PDB files.
 
-Dynamics currently supports the `torch` backend only. The timed loop lives in
-`NvalchemiOpsBenchmark`: warmup steps run first, `wp.synchronize()` is called
-before and after the timed step loop, and the reported value is the mean wall
-time per full MD/optimization step.
+Dynamics currently supports the `torch` backend only. Standard Lennard-Jones
+timing lives in `NvalchemiOpsBenchmark`: warmup steps run first,
+`wp.synchronize()` is called before and after the timed step loop, and the
+reported value is the mean wall time per full MD/optimization step. Optional
+Toolkit model-stack timing synchronizes both Torch CUDA and Warp queues. For
+model-stack optimization rows, warmup runs on a throwaway batch and the timed
+optimization starts from the original geometry.
 
 Supported methods are `velocity_verlet`, `langevin`, `npt`, `nph`, `fire`, and
 `fire2`. Convenience aliases include `vv` and `nve` for `velocity_verlet`, and
 `fire1` for `fire`.
+
+Optional Toolkit model-stack methods are disabled by default and selected with
+`--method`. MD rows are `tnet_d3`, `mace_d3`, `mace_d3_pme`, and
+`mace_d3_ewald`. Optimization rows add FIRE/FIRE2 suffixes, for example
+`tnet_d3_fire`, `tnet_d3_fire2`, `mace_d3_pme_fire`, and
+`mace_d3_ewald_fire2`. These compose public Toolkit wrappers with
+`PipelineModelWrapper`; the benchmark does not modify Toolkit source. TensorNet
+is loaded through MatGL's packaged `matgl.ext.alchmtk.TensorNetWrapper`
+integration and is rebuilt with Warp layers when `require_warp: true`.
+PME/Ewald use the fixed charges carried by the CsCl/NH3 benchmark systems, so
+those rows measure an additive fixed-charge long-range term rather than a
+learned charge model.
 
 ```bash
 WARP_CACHE_PATH=/tmp/warp-cache-toolkit-ops \
@@ -54,6 +71,31 @@ python -m benchmarks.benchmark_suite --benchmark dyn --backend torch \
     --system lj --mode batch_scaling --method vv fire2 \
     --timing-runs 3 --warmup-runs 1 --max-total-atoms 2048 \
     --output-dir /tmp/dyn-smoke
+```
+
+Small model-stack smoke test:
+
+```bash
+WARP_CACHE_PATH=/tmp/warp-cache-toolkit-ops \
+TORCH_EXTENSIONS_DIR=/tmp/torch-ext-toolkit-ops \
+python -m benchmarks.benchmark_suite --benchmark dyn --backend torch \
+    --system cscl --mode system_size \
+    --method tnet_d3 mace_d3_pme mace_d3_ewald tnet_d3_fire mace_d3_pme_fire \
+    --timing-runs 1 --warmup-runs 0 --max-total-atoms 64 --output-dir /tmp/dyn-model-smoke
+```
+
+Apples-to-apples model-stack run over system-size and constant-workload modes:
+
+```bash
+WARP_CACHE_PATH=/tmp/warp-cache-toolkit-ops \
+TORCH_EXTENSIONS_DIR=/tmp/torch-ext-toolkit-ops \
+python -m benchmarks.benchmark_suite --benchmark dyn --backend torch \
+    --system cscl --mode system_size constant_workload \
+    --method tnet_d3 mace_d3_pme mace_d3_ewald \
+             tnet_d3_fire tnet_d3_fire2 \
+             mace_d3_pme_fire mace_d3_pme_fire2 \
+             mace_d3_ewald_fire mace_d3_ewald_fire2 \
+    --output-dir /tmp/dyn-model-apples
 ```
 
 For a full dynamics run, omit the smoke-test overrides:
@@ -362,6 +404,9 @@ Results are saved as CSV files in `docs/benchmarks/benchmark_results/`:
 - `dyn-lj-system-size-scaling.csv`
 - `dyn-lj-constant-workload-scaling.csv`
 - `dyn-lj-batch-scaling.csv`
+- `dyn-cscl-system-size-scaling.csv`
+- `dyn-cscl-batch-scaling.csv`
+- `dyn-nh3-system-size-scaling.csv`
 - `fire_compare_<gpu_sku>.csv`
 - `fire2_kernel_benchmark_<gpu_sku>.csv`
 

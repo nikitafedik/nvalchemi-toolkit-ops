@@ -1,0 +1,39 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+[project]
+name = "omat-benchmark-stack"
+version = "0.0.0"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    "nvalchemi-toolkit[ase,mace]==0.1.0",
+    "nvalchemi-toolkit-ops[torch]",
+    "torch==2.12.0+cu130; sys_platform != 'darwin'",
+    "cuequivariance-ops-torch-cu13==0.10.0; sys_platform != 'darwin'",
+    "matgl==4.0.2",
+    "matplotlib",
+    "pandas",
+    "pyyaml>=6.0",
+]
+
+[tool.uv]
+managed = true
+index-strategy = "unsafe-best-match"
+override-dependencies = [
+    "python-hostlist; sys_platform == 'never'",
+]
+
+[tool.uv.sources]
+nvalchemi-toolkit-ops = { path = "..", editable = true }
+torch = [
+    { index = "pytorch-cu130", marker = "sys_platform != 'darwin'" },
+]
+
+[[tool.uv.index]]
+name = "nvidia"
+url = "https://pypi.nvidia.com"
+
+[[tool.uv.index]]
+name = "pytorch-cu130"
+url = "https://download.pytorch.org/whl/cu130"
+explicit = true

@@ -15,9 +15,10 @@
 
 """Chemical system generation and loading for benchmarks.
 
-Two systems supported:
+Systems supported:
 - CsCl (cesium chloride): BCC-like crystal, 2 atoms/unit cell, programmatic
 - NH3 (ammonia): Packmol-packed PBC boxes, loaded from PDB files
+- OMat sample: packed PyTorch dataset, loaded from ``benchmarks/omat``
 
 Each system provides: positions, atomic_numbers, cell, pbc, charges (optional),
 and batching support via tiling/replication.
@@ -41,14 +42,18 @@ __all__ = [
     "create_cscl_batch",
     "create_cscl_system",
     "create_nh3_batch",
+    "create_omat_batch",
     "create_system",
     "find_nh3_pdbs",
     "filter_configs_by_total_atoms",
     "get_constant_atoms_configs",
     "get_constant_total_configs",
     "get_system_size_configs",
+    "omat_dataset_system_count",
+    "omat_prefix_rollover_counts",
     "planned_atom_counts",
     "load_nh3_system",
+    "load_omat_system",
     "parse_pdb",
     "resolve_nh3_dir",
 ]
@@ -82,6 +87,8 @@ def cscl_actual_atoms(n):
 # Default paths (relative to benchmarks/ directory)
 SCRIPT_DIR = Path(__file__).parent
 DEFAULT_NH3_DIR = SCRIPT_DIR / "nh3"
+DEFAULT_OMAT_PATH = SCRIPT_DIR / "omat" / "omat24_sample.pt"
+_OMAT_CACHE: dict[Path, dict] = {}
 
 
 # =============================================================================
@@ -465,6 +472,157 @@ def create_cscl_batch(
 
 
 # =============================================================================
+# OMat Sample Dataset Loading
+# =============================================================================
+
+
+def _load_omat_archive(dataset_path: str | Path | None = None) -> dict:
+    """Load and cache the packed OMat sample archive on CPU."""
+    path = Path(dataset_path or DEFAULT_OMAT_PATH).expanduser()
+    if not path.is_absolute():
+        path = SCRIPT_DIR.parent / path
+    path = path.resolve()
+    if path not in _OMAT_CACHE:
+        if not path.exists():
+            raise FileNotFoundError(f"OMat sample dataset not found: {path}")
+        _OMAT_CACHE[path] = torch.load(path, map_location="cpu", weights_only=False)
+    return _OMAT_CACHE[path]
+
+
+def _omat_atom_segments(dataset_path: str | Path | None = None) -> torch.Tensor:
+    """Return per-system atom counts from a packed OMat sample archive."""
+    archive = _load_omat_archive(dataset_path)
+    return archive["segment_lengths"]["atoms"].to(dtype=torch.long)
+
+
+def _target_prefix_count(segments: torch.Tensor, target_atoms: int) -> tuple[int, int]:
+    """Return the OMat prefix length and actual atoms nearest ``target_atoms``."""
+    total_available = int(segments.sum().item())
+    repeats = max(1, int(np.ceil(target_atoms / max(total_available, 1))))
+    systems_to_include = 0
+    cumulative_atoms = 0
+
+    for atom_count in segments.tolist() * repeats:
+        atom_count = int(atom_count)
+        if cumulative_atoms + atom_count <= target_atoms:
+            cumulative_atoms += atom_count
+            systems_to_include += 1
+            continue
+        if (
+            target_atoms - cumulative_atoms
+            > cumulative_atoms + atom_count - target_atoms
+        ):
+            cumulative_atoms += atom_count
+            systems_to_include += 1
+        break
+
+    return max(systems_to_include, 1), cumulative_atoms
+
+
+def omat_prefix_rollover_counts(
+    dataset_path: str | Path | None,
+    target_atoms: int,
+) -> tuple[int, int]:
+    """Return ``(num_systems, total_atoms)`` for OMat prefix-rollover batching."""
+    segments = _omat_atom_segments(dataset_path)
+    return _target_prefix_count(segments, int(target_atoms))
+
+
+def omat_dataset_system_count(dataset_path: str | Path | None) -> int:
+    """Return the number of systems in a packed OMat sample archive."""
+    return int(_omat_atom_segments(dataset_path).numel())
+
+
+def _omat_slice(dataset_path: str | Path | None, segment_index: int) -> dict:
+    """Return one OMat system as a backend-neutral numpy dictionary."""
+    archive = _load_omat_archive(dataset_path)
+    data = archive["data"]
+    segments = archive["segment_lengths"]["atoms"].to(dtype=torch.long)
+    if segment_index < 0 or segment_index >= int(segments.numel()):
+        raise IndexError(
+            f"OMat segment_index {segment_index} out of range for {segments.numel()} systems"
+        )
+    starts = torch.cat([torch.zeros(1, dtype=torch.long), torch.cumsum(segments, 0)])
+    start = int(starts[segment_index])
+    end = int(starts[segment_index + 1])
+    charge = data.get("charge")
+    np_data = {
+        "positions": data["coord"][start:end].numpy().astype(np.float32),
+        "atomic_numbers": data["numbers"][start:end].numpy().astype(np.int32),
+        "cell": data["cell"][segment_index].numpy().astype(np.float32),
+        "pbc": np.ones(3, dtype=bool),
+        "batch_idx": np.zeros(end - start, dtype=np.int32),
+        "num_atoms": end - start,
+        "total_atoms": end - start,
+        "batch_size": 1,
+        "segment_index": int(segment_index),
+    }
+    if charge is not None:
+        np_data["charge"] = np.asarray([float(charge[segment_index])], dtype=np.float32)
+    return np_data
+
+
+def load_omat_system(
+    dataset_path: str | Path | None,
+    segment_index: int,
+    device: str = "cuda",
+    dtype: torch.dtype = torch.float32,
+    backend: str = "torch",
+) -> dict:
+    """Load one system from a packed OMat sample archive.
+
+    Parameters
+    ----------
+    dataset_path : str or Path
+        Path to the packed OMat ``.pt`` sample.
+    segment_index : int
+        System index within the packed archive.
+    device : str, default='cuda'
+        PyTorch device (only used for ``backend='torch'``).
+    dtype : torch.dtype, default=torch.float32
+        Floating-point precision.
+    backend : str, default='torch'
+        Framework backend: ``'torch'`` or ``'jax'``.
+
+    Returns
+    -------
+    dict
+        System dictionary with positions, atomic numbers, cell, pbc, and charge.
+    """
+    np_data = _omat_slice(dataset_path, int(segment_index))
+    return _dispatch_backend(np_data, backend, device, dtype)
+
+
+def create_omat_batch(
+    dataset_path: str | Path | None,
+    segment_index: int,
+    batch_size: int,
+    device: str = "cuda",
+    dtype: torch.dtype = torch.float32,
+    backend: str = "torch",
+) -> dict:
+    """Create a replicated batch from one OMat sample system."""
+    single = _omat_slice(dataset_path, int(segment_index))
+    n = int(single["num_atoms"])
+    np_data = {
+        "positions": np.tile(single["positions"], (batch_size, 1)).astype(np.float32),
+        "atomic_numbers": np.tile(single["atomic_numbers"], batch_size).astype(
+            np.int32
+        ),
+        "cell": np.tile(single["cell"][None], (batch_size, 1, 1)).astype(np.float32),
+        "pbc": np.tile(single["pbc"], (batch_size, 1)),
+        "batch_idx": np.repeat(np.arange(batch_size, dtype=np.int32), n),
+        "num_atoms": n,
+        "total_atoms": n * batch_size,
+        "batch_size": batch_size,
+        "segment_index": int(segment_index),
+    }
+    if "charge" in single:
+        np_data["charge"] = np.tile(single["charge"], batch_size).astype(np.float32)
+    return _dispatch_backend(np_data, backend, device, dtype)
+
+
+# =============================================================================
 # Unified System Factory
 # =============================================================================
 
@@ -473,6 +631,8 @@ def create_system(
     system_type: str,
     num_atoms: int | None = None,
     pdb_path: str | Path | None = None,
+    dataset_path: str | Path | None = None,
+    segment_index: int | None = None,
     batch_size: int = 1,
     device: str = "cuda",
     dtype: torch.dtype = torch.float32,
@@ -483,11 +643,15 @@ def create_system(
     Parameters
     ----------
     system_type : str
-        'cscl' or 'nh3'.
+        'cscl', 'nh3', or 'omat'.
     num_atoms : int, optional
         Target atoms per system (required for CsCl, ignored for NH3).
     pdb_path : str or Path, optional
         PDB file path (required for NH3, ignored for CsCl).
+    dataset_path : str or Path, optional
+        Packed OMat sample path (required for OMat unless using the default).
+    segment_index : int, optional
+        OMat system index within ``dataset_path``.
     batch_size : int, default=1
         Number of system replicas.
     device : str, default='cuda'
@@ -527,8 +691,31 @@ def create_system(
                 pdb_path, batch_size, device=device, dtype=dtype, backend=backend
             )
 
+    elif system_type == "omat":
+        if segment_index is None:
+            raise ValueError("segment_index required for OMat systems")
+        if batch_size == 1:
+            return load_omat_system(
+                dataset_path,
+                segment_index,
+                device=device,
+                dtype=dtype,
+                backend=backend,
+            )
+        else:
+            return create_omat_batch(
+                dataset_path,
+                segment_index,
+                batch_size,
+                device=device,
+                dtype=dtype,
+                backend=backend,
+            )
+
     else:
-        raise ValueError(f"Unknown system type: {system_type}. Use 'cscl' or 'nh3'.")
+        raise ValueError(
+            f"Unknown system type: {system_type}. Use 'cscl', 'nh3', or 'omat'."
+        )
 
 
 # =============================================================================
@@ -536,7 +723,7 @@ def create_system(
 # =============================================================================
 
 
-def get_system_size_configs(system_type, atom_counts, nh3_dir=None):
+def get_system_size_configs(system_type, atom_counts, nh3_dir=None, sys_config=None):
     """Generate configs for system-size scaling (batch=1, vary N).
 
     Parameters
@@ -547,6 +734,8 @@ def get_system_size_configs(system_type, atom_counts, nh3_dir=None):
         Target atom counts.
     nh3_dir : str or Path, optional
         NH3 PDB directory.
+    sys_config : dict, optional
+        Full system config. Used by OMat for dataset path and sampling controls.
 
     Yields
     ------
@@ -561,6 +750,36 @@ def get_system_size_configs(system_type, atom_counts, nh3_dir=None):
             if atom_counts and n not in atom_counts:
                 continue
             yield {"num_atoms": n, "pdb_path": pdb, "batch_size": 1}
+    elif system_type == "omat":
+        sys_config = sys_config or {}
+        dataset_path = sys_config.get("dataset_path", DEFAULT_OMAT_PATH)
+        segments = _omat_atom_segments(dataset_path)
+        segment_indices = sys_config.get("segment_indices")
+        max_per_count = int(sys_config.get("max_systems_per_atom_count", 1))
+        seen_by_count: dict[int, int] = {}
+        candidates = (
+            [int(i) for i in segment_indices]
+            if segment_indices is not None
+            else range(int(segments.numel()))
+        )
+        rows = []
+        for idx in candidates:
+            n = int(segments[idx])
+            if atom_counts and n not in atom_counts:
+                continue
+            seen = seen_by_count.get(n, 0)
+            if segment_indices is None and max_per_count > 0 and seen >= max_per_count:
+                continue
+            seen_by_count[n] = seen + 1
+            rows.append(
+                {
+                    "num_atoms": n,
+                    "dataset_path": str(dataset_path),
+                    "segment_index": idx,
+                    "batch_size": 1,
+                }
+            )
+        yield from sorted(rows, key=lambda row: (row["num_atoms"], row["segment_index"]))
     else:
         for n in atom_counts:
             yield {"num_atoms": n, "pdb_path": None, "batch_size": 1}
@@ -604,7 +823,12 @@ def get_constant_total_configs(system_type, target_atoms, nh3_dir=None):
 
 
 def get_constant_atoms_configs(
-    system_type, atoms_per_system_sizes, max_total_atoms=131072, nh3_dir=None
+    system_type,
+    atoms_per_system_sizes,
+    max_total_atoms=131072,
+    nh3_dir=None,
+    sys_config=None,
+    batch_sizes=None,
 ):
     """Generate configs for constant-atoms-per-system scaling (vary batch).
 
@@ -626,8 +850,13 @@ def get_constant_atoms_configs(
     dict
         Config with 'num_atoms', 'pdb_path', 'batch_size'.
     """
-    # Batch sizes: powers of 2, capped by max_total_atoms
-    all_batch_sizes = [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024]
+    # Default batch sizes are powers of 2. Callers can pass explicit sizes for
+    # finer sweeps around OOM cliffs.
+    all_batch_sizes = (
+        [int(bs) for bs in batch_sizes]
+        if batch_sizes is not None
+        else [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024]
+    )
 
     if system_type == "nh3":
         pdb_files = find_nh3_pdbs(nh3_dir)
@@ -640,6 +869,67 @@ def get_constant_atoms_configs(
                 if n * bs > max_total_atoms:
                     break  # stop growing batch for this atom size
                 yield {"num_atoms": n, "pdb_path": pdb, "batch_size": bs}
+    elif system_type == "omat":
+        sys_config = sys_config or {}
+        dataset_path = sys_config.get("dataset_path", DEFAULT_OMAT_PATH)
+        batch_construction = str(
+            sys_config.get("batch_construction", "repeat_segment")
+        )
+        if batch_construction == "prefix_rollover":
+            atom_count_targets = sys_config.get("atom_count_targets")
+            if atom_count_targets is None:
+                atom_count_targets = [
+                    int(n) * int(bs)
+                    for n in atoms_per_system_sizes
+                    for bs in all_batch_sizes
+                ]
+            for target_atoms in atom_count_targets:
+                target_atoms = int(target_atoms)
+                if target_atoms > max_total_atoms:
+                    continue
+                batch_size, total_atoms = omat_prefix_rollover_counts(
+                    dataset_path,
+                    target_atoms,
+                )
+                atoms_per_system = max(1, int(round(total_atoms / batch_size)))
+                yield {
+                    "num_atoms": atoms_per_system,
+                    "target_atoms": target_atoms,
+                    "dataset_path": str(dataset_path),
+                    "segment_index": "",
+                    "batch_size": batch_size,
+                    "total_atoms": total_atoms,
+                    "batch_construction": batch_construction,
+                }
+            return
+
+        segments = _omat_atom_segments(dataset_path)
+        requested_sizes = {int(n) for n in atoms_per_system_sizes}
+        segment_indices = sys_config.get("segment_indices")
+        max_per_count = int(sys_config.get("max_systems_per_atom_count", 1))
+        seen_by_count: dict[int, int] = {}
+        candidates = (
+            [int(i) for i in segment_indices]
+            if segment_indices is not None
+            else range(int(segments.numel()))
+        )
+        for idx in candidates:
+            n = int(segments[idx])
+            if requested_sizes and n not in requested_sizes:
+                continue
+            seen = seen_by_count.get(n, 0)
+            if segment_indices is None and max_per_count > 0 and seen >= max_per_count:
+                continue
+            seen_by_count[n] = seen + 1
+            for bs in all_batch_sizes:
+                if n * bs > max_total_atoms:
+                    break
+                yield {
+                    "num_atoms": n,
+                    "dataset_path": str(dataset_path),
+                    "segment_index": idx,
+                    "batch_size": bs,
+                }
     else:
         for n in atoms_per_system_sizes:
             actual = cscl_actual_atoms(n)
@@ -713,7 +1003,7 @@ def configs_for_mode(
     atom_counts = sys_config.get("atom_counts", [])
     constant_atoms_sizes = sys_config.get("constant_atoms_sizes", [1024, 8192])
     if mode_name == "system_size":
-        return list(get_system_size_configs(sys_name, atom_counts, nh3_dir))
+        return list(get_system_size_configs(sys_name, atom_counts, nh3_dir, sys_config))
     if mode_name == "constant_workload":
         return list(
             get_constant_total_configs(sys_name, mode_config["target_atoms"], nh3_dir)
@@ -725,6 +1015,8 @@ def configs_for_mode(
                 constant_atoms_sizes,
                 mode_config["max_total_atoms"],
                 nh3_dir,
+                sys_config,
+                mode_config.get("batch_sizes"),
             )
         )
     return []
@@ -733,6 +1025,8 @@ def configs_for_mode(
 def planned_atom_counts(sys_name: str, cfg: dict) -> tuple[int, int, int]:
     """Return ``(atoms_per_system, batch_size, total_atoms)`` without allocation."""
     batch_size = int(cfg["batch_size"])
+    if sys_name == "omat" and cfg.get("batch_construction") == "prefix_rollover":
+        return int(cfg["num_atoms"]), batch_size, int(cfg["total_atoms"])
     if sys_name == "cscl":
         atoms_per_system = cscl_actual_atoms(cfg["num_atoms"])
     else:
