@@ -431,6 +431,28 @@ def _set_energy_forces(model: torch.nn.Module) -> torch.nn.Module:
     return model
 
 
+def _freeze_model_parameters(model: torch.nn.Module) -> torch.nn.Module:
+    """Disable parameter gradients for inference-only benchmark runs."""
+    for param in model.parameters():
+        param.requires_grad = False
+    return model
+
+
+def _compile_tensornet_model(model: torch.nn.Module, tnet_cfg: dict[str, Any]) -> torch.nn.Module:
+    """Compile the inner MatGL TensorNet model when requested."""
+    compile_model = bool(tnet_cfg.get("compile_model", False))
+    setattr(model, "tnet_compile_enabled", False)
+    if not compile_model:
+        return model
+
+    compile_kwargs = dict(tnet_cfg.get("compile_kwargs", {}) or {})
+    uses_warp = bool(getattr(model.model, "_use_warp", False))
+    model.model = torch.compile(model.model, **compile_kwargs)
+    setattr(model.model, "_use_warp", uses_warp)
+    setattr(model, "tnet_compile_enabled", True)
+    return model
+
+
 def _ensure_tensornet_warp_potential(potential):
     """Return a TensorNet Potential whose wrapped model uses Warp layers."""
     model = potential.model
@@ -479,7 +501,9 @@ def _build_tensornet(stack: dict[str, Any], device: torch.device) -> torch.nn.Mo
         potential = _ensure_tensornet_warp_potential(potential)
     model = TensorNetWrapper.from_potential(potential)
     model = _set_energy_forces(model)
+    model.model = _freeze_model_parameters(model.model)
     model.to(device)
+    model = _compile_tensornet_model(model, tnet_cfg)
     uses_warp = bool(getattr(model.model, "_use_warp", False))
     if require_warp and not uses_warp:
         raise RuntimeError(

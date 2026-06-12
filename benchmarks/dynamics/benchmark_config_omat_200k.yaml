@@ -7,8 +7,8 @@
 # counts as closely as possible.
 
 parameters:
-  warmup_runs: 10
-  timing_runs: 20
+  warmup_runs: 3
+  timing_runs: 6
   max_total_atoms: 200000
   dtype: "float32"
   seed: 42
@@ -67,30 +67,7 @@ model_stacks:
       dataset_path: benchmarks/omat/omat24_sample.pt
       atom_counts: []
       batch_construction: prefix_rollover
-      atom_count_targets:
-        - 1024
-        - 2048
-        - 5000
-        - 10000
-        - 20000
-        - 30000
-        - 40000
-        - 50000
-        - 60000
-        - 70000
-        - 80000
-        - 90000
-        - 100000
-        - 110000
-        - 120000
-        - 130000
-        - 140000
-        - 150000
-        - 160000
-        - 170000
-        - 180000
-        - 190000
-        - 200000
+      atom_count_targets: []
       max_systems_per_atom_count: 1
       constant_atoms_sizes: [192]
 
@@ -130,12 +107,14 @@ model_stacks:
   tensornet:
     model_name: "TensorNet-PES-MatPES-PBE-2025.2"
     require_warp: true
+    compile_model: true
+    compile_kwargs: {}
 
   mace:
     checkpoint: "medium-mpa-0"
     enable_cueq: true
     dtype: "float32"
-    compile_model: false
+    compile_model: true
     compile_kwargs: {}
 
   d3:
