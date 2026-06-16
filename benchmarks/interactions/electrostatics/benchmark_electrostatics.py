@@ -456,17 +456,7 @@ def _benchmark_ewald_jax(
     warmup_runs,
     jax_api,
 ):
-    """JAX backend implementation of :func:`benchmark_ewald`.
-
-    Raises ``NotImplementedError`` when ``compute_cg=True`` because the JAX
-    ``ewald_summation`` API hard-codes ``compute_charge_gradients=False`` for
-    the combined real+reciprocal call. The caller logs a ``success=False`` row.
-    """
-    if compute_cg:
-        raise NotImplementedError(
-            "jax_cg_unsupported: ewald_summation does not accept "
-            "compute_charge_gradients in the current JAX API"
-        )
+    """JAX backend implementation of :func:`benchmark_ewald`."""
 
     jax = jax_api["jax"]
     jax_ewald = jax_api["ewald_summation"]
@@ -519,6 +509,7 @@ def _benchmark_ewald_jax(
             neighbor_shifts=inputs.nl_shifts,
             k_vectors=k_vectors,
             compute_forces=True,
+            compute_charge_gradients=compute_cg,
             accuracy=accuracy,
         )
 
@@ -1230,8 +1221,13 @@ def main():
     if backend == "jax":
         ensure_jax_available(need_electrostatics=True)
 
-    run_from_config(config, output_dir=args.output_dir, backend=backend)
+    results = run_from_config(config, output_dir=args.output_dir, backend=backend)
+    if not results:
+        return 1
+    if not any(row.get("success", True) is not False for row in results):
+        return 1
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())
