@@ -15,6 +15,7 @@
 
 """Tests for benchmark planning and result-schema helpers."""
 
+import csv
 import math
 from pathlib import Path
 from types import SimpleNamespace
@@ -32,6 +33,7 @@ from benchmarks.config import (
     merge_common_cli_overrides,
     normalize_method_name,
 )
+from benchmarks.interactions.dispersion import benchmark_dftd3
 from benchmarks.interactions.dispersion.benchmark_dftd3 import (
     dry_run_from_config as dry_run_d3,
 )
@@ -42,6 +44,7 @@ from benchmarks.interactions.electrostatics.benchmark_electrostatics import (
 from benchmarks.interactions.electrostatics.benchmark_electrostatics import (
     dry_run_from_config as dry_run_el,
 )
+from benchmarks.neighborlist import benchmark_neighborlist
 from benchmarks.neighborlist.benchmark_neighborlist import (
     _nl_method_for_case,
 )
@@ -57,8 +60,10 @@ from benchmarks.suite_systems import (
 )
 from benchmarks.suite_utils import (
     build_failure_result,
+    build_result,
     build_skipped_result,
     measure_memory_jax,
+    save_results,
 )
 
 
@@ -114,14 +119,25 @@ class TestBenchmarkMethodSelection:
         assert merged["runtime"]["explicit_methods"] is True
 
     def test_cluster_tile_resolves_to_batch_api_for_batched_cases(self):
-        """Default method expansion maps cluster-tile to the batched API."""
+        """Method expansion maps cluster-tile to the batch-shaped API."""
         assert _nl_method_for_case("cluster_tile", batch_size=1, explicit=False) == (
             "cluster_tile"
         )
         assert _nl_method_for_case("cluster_tile", batch_size=4, explicit=False) == (
             "batch_cluster_tile"
         )
-        assert _nl_method_for_case("cluster_tile", batch_size=4, explicit=True) is None
+        assert _nl_method_for_case("cluster_tile", batch_size=4, explicit=True) == (
+            "batch_cluster_tile"
+        )
+
+    def test_explicit_nl_methods_still_follow_batch_shape(self):
+        """CLI method filters select a family, not a mismatched batch API."""
+        assert _nl_method_for_case("batch_cell_list", batch_size=1, explicit=True) == (
+            "cell_list"
+        )
+        assert _nl_method_for_case("cell_list", batch_size=4, explicit=True) == (
+            "batch_cell_list"
+        )
 
 
 class TestSuiteBackendSelection:
@@ -148,9 +164,7 @@ class TestBenchmarkSuitePlotting:
     def test_nl_plot_labels_cluster_tile_family(self):
         """NL plot labels collapse batch/unbatch cluster methods cleanly."""
         assert plot_benchmarks._nl_method_family("cluster_tile") == "cluster_tile"
-        assert (
-            plot_benchmarks._nl_method_family("batch_cluster_tile") == "cluster_tile"
-        )
+        assert plot_benchmarks._nl_method_family("batch_cluster_tile") == "cluster_tile"
         assert plot_benchmarks._nl_method_label("batch_cluster_tile") == "Cluster tile"
 
     def test_plot_only_short_circuits_inside_main(self, monkeypatch, tmp_path):
@@ -209,14 +223,42 @@ class TestBenchmarkSuitePlotting:
                 "filtered single-panel plotting should not render 3-panel plots"
             )
 
-        def record_single_panel(_csv_path, panel, _output_path):
+        def record_single_panel(_csv_path, panel, output_path):
+            Path(output_path).write_text("png", encoding="utf-8")
             panels.append(panel)
+            return True
 
         monkeypatch.setattr(plot_benchmarks, "detect_and_plot", fail_three_panel)
         monkeypatch.setattr(plot_benchmarks, "plot_single_panel", record_single_panel)
 
         assert benchmark_suite._generate_plots(tmp_path, plots=["time"]) is True
         assert panels == ["time"]
+
+    def test_generate_plots_fails_when_single_panel_has_no_data(self, tmp_path):
+        """All-failed CSVs are not counted as successfully rendered plots."""
+        csv_path = tmp_path / "nl-cscl-system-size-scaling.csv"
+        csv_path.write_text(
+            "success,backend,method,total_atoms\nFalse,torch,cell_list,2\n"
+        )
+
+        assert benchmark_suite._generate_plots(tmp_path, plots=["time"]) is False
+
+    def test_suite_detects_yaml_selected_jax_backend(self, monkeypatch, tmp_path):
+        """Suite-level JAX env setup honors YAML runtime backend, not just CLI."""
+        config_path = tmp_path / "benchmark_config.yaml"
+        config_path.write_text("runtime:\n  backend: jax\n", encoding="utf-8")
+        monkeypatch.setitem(
+            benchmark_suite.RUNNERS,
+            "nl",
+            {
+                "label": "NL",
+                "config": config_path,
+                "module": "benchmarks.neighborlist.benchmark_neighborlist",
+            },
+        )
+        args = SimpleNamespace(backend=None)
+
+        assert benchmark_suite._suite_needs_jax_env(args, {"nl"}) is True
 
     def test_dry_run_with_no_planned_rows_fails(self, monkeypatch):
         """Dry-run exits nonzero when CLI filters produce an empty plan."""
@@ -319,9 +361,7 @@ class TestBenchmarkSuitePlotting:
         def fake_import(module_name):
             if module_name.endswith("benchmark_neighborlist"):
                 return SimpleNamespace(
-                    run_from_config=lambda _config, output_dir=None: [
-                        {"success": True}
-                    ]
+                    run_from_config=lambda _config, output_dir=None: [{"success": True}]
                 )
             return SimpleNamespace(
                 run_from_config=lambda _config, output_dir=None: [
@@ -388,6 +428,19 @@ class TestBenchmarkAtomPlanning:
             {"num_atoms": 256, "pdb_path": None, "batch_size": 1},
         ]
 
+    def test_actual_nh3_missing_pdbs_fall_back_to_planned_configs(self, tmp_path):
+        """Actual runs keep row accounting when generated NH3 PDBs are absent."""
+        configs = configs_for_mode(
+            "system_size",
+            {"enabled": True},
+            "nh3",
+            {"enabled": True, "atom_counts": [128]},
+            tmp_path / "missing-nh3",
+            plan_only=False,
+        )
+
+        assert configs == [{"num_atoms": 128, "pdb_path": None, "batch_size": 1}]
+
 
 class TestFailureRows:
     """Test failure row schema used by benchmark CSV output."""
@@ -412,6 +465,49 @@ class TestFailureRows:
         assert row["error"] == "boom"
         assert row["error_type"] == "RuntimeError"
         assert row["method"] == "cell_list"
+
+    def test_success_result_uses_stable_error_columns(self):
+        """Successful rows still carry empty error columns for append stability."""
+        row = build_result(
+            benchmark="nl",
+            backend="torch",
+            system="cscl",
+            scaling_mode="system_size",
+            method="cell_list",
+            atoms_per_system=128,
+            batch_size=1,
+            total_atoms=128,
+            time_seconds=1.0,
+            mem_info={"mem_delta_mb": 0.0, "mem_peak_gb": 0.0},
+        )
+
+        assert row["success"] is True
+        assert row["error"] == ""
+        assert row["error_type"] == ""
+
+    def test_save_results_preserves_existing_rows_when_schema_expands(self, tmp_path):
+        """Appending failure rows to legacy CSV headers does not clobber data."""
+        csv_path = tmp_path / "results.csv"
+        csv_path.write_text("system,success\ncscl,True\n", encoding="utf-8")
+        row = build_failure_result(
+            error="boom",
+            error_type="RuntimeError",
+            benchmark="nl",
+            backend="torch",
+            system="nh3",
+            scaling_mode="system_size",
+            method="cell_list",
+            atoms_per_system=128,
+            batch_size=1,
+            total_atoms=128,
+        )
+
+        save_results([row], csv_path)
+
+        with open(csv_path, newline="") as f:
+            rows = list(csv.DictReader(f))
+        assert [row["system"] for row in rows] == ["cscl", "nh3"]
+        assert rows[1]["error"] == "boom"
 
     def test_build_skipped_result_sets_policy_error_type(self):
         """Policy skips use the same failure-row schema as runtime failures."""
@@ -619,6 +715,105 @@ class TestDryRunSkipPlanning:
         assert rows[0]["error"] == "setup boom"
         assert rows[0]["error_type"] == "RuntimeError"
         assert rows[0]["method"] == "pme"
+
+    def test_nl_setup_failure_is_written_as_failure_rows(self, monkeypatch, tmp_path):
+        """NL setup failures emit one row per planned method/cutoff."""
+        config = {
+            "parameters": {"timing_runs": 1, "warmup_runs": 1, "cutoffs": [6.0]},
+            "runtime": {},
+            "systems": {"cscl": {"enabled": True, "atom_counts": [128]}},
+            "scaling": {"system_size": {"enabled": True}},
+            "methods": [{"name": "cell_list", "enabled": True}],
+            "output": {"base_dir": str(tmp_path)},
+        }
+
+        monkeypatch.setattr(benchmark_neighborlist, "clean_gpu", lambda: None)
+        monkeypatch.setattr(
+            benchmark_neighborlist,
+            "create_system",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("setup boom")),
+        )
+
+        rows = benchmark_neighborlist.run_from_config(
+            config,
+            output_dir=tmp_path,
+            backend="torch",
+        )
+
+        assert len(rows) == 1
+        assert rows[0]["success"] is False
+        assert rows[0]["error"] == "setup boom"
+        assert rows[0]["error_type"] == "RuntimeError"
+
+    def test_nl_warp_cluster_tile_is_policy_skipped_before_allocation(
+        self, monkeypatch, tmp_path
+    ):
+        """Warp cluster-tile rows are explicit skips, not unsupported failures."""
+        config = {
+            "parameters": {"timing_runs": 1, "warmup_runs": 1, "cutoffs": [6.0]},
+            "runtime": {},
+            "systems": {"cscl": {"enabled": True, "atom_counts": [128]}},
+            "scaling": {"system_size": {"enabled": True}},
+            "methods": [{"name": "cluster_tile", "enabled": True}],
+            "output": {"base_dir": str(tmp_path)},
+        }
+
+        def fail_create_system(*_args, **_kwargs):
+            pytest.fail("policy-skipped cluster_tile should not allocate")
+
+        monkeypatch.setattr(benchmark_neighborlist, "create_system", fail_create_system)
+
+        rows = benchmark_neighborlist.run_from_config(
+            config,
+            output_dir=tmp_path,
+            backend="warp",
+        )
+
+        assert len(rows) == 1
+        assert rows[0]["success"] is False
+        assert rows[0]["error_type"] == "SkippedByPolicy"
+        assert rows[0]["error"] == "warp backend does not support cluster_tile"
+
+    def test_d3_setup_failure_is_written_as_failure_rows(self, monkeypatch, tmp_path):
+        """D3 setup failures emit one row per planned cutoff."""
+        params_path = tmp_path / "d3_params.pt"
+        torch.save({"rcov": torch.tensor([1.0])}, params_path)
+        config = {
+            "params_path": str(params_path),
+            "parameters": {
+                "timing_runs": 1,
+                "warmup_runs": 1,
+                "cutoffs": [6.0, 15.0],
+            },
+            "runtime": {},
+            "systems": {"cscl": {"enabled": True, "atom_counts": [128]}},
+            "scaling": {"system_size": {"enabled": True}},
+            "methods": [{"name": "dftd3", "enabled": True}],
+            "dftd3_parameters": {"a1": 0.4289, "a2": 4.4407, "s8": 0.7875},
+            "output": {"base_dir": str(tmp_path)},
+        }
+
+        monkeypatch.setattr(
+            benchmark_dftd3,
+            "_torch_d3_params_to_device",
+            lambda params, _device: params,
+        )
+        monkeypatch.setattr(
+            benchmark_dftd3,
+            "create_system",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("setup boom")),
+        )
+
+        rows = benchmark_dftd3.run_from_config(
+            config,
+            output_dir=tmp_path,
+            backend="torch",
+        )
+
+        assert len(rows) == 2
+        assert {row["cutoff"] for row in rows} == {6.0, 15.0}
+        assert {row["error"] for row in rows} == {"setup boom"}
+
 
 class TestJaxMemoryContract:
     """Test JAX memory metadata behavior."""
