@@ -303,7 +303,7 @@ def plot_module(
 
 def plot_single_panel(
     csv_path: str | Path, panel: str, output_path: str | Path
-) -> None:
+) -> bool:
     """Render one panel (time/throughput/memory) from a CSV to a standalone PNG.
 
     This is the primary entry point for docs/benchmarks/generate_plots.py.
@@ -319,12 +319,18 @@ def plot_single_panel(
         One of 'time', 'throughput', 'memory'.
     output_path : str or Path
         Where to save the PNG.
+
+    Returns
+    -------
+    bool
+        True when a plot image was written; False when the CSV contained no
+        successful data or the module name was not recognized.
     """
     csv_path = Path(csv_path)
     output_path = Path(output_path)
     data = load_csv(csv_path)
     if not data:
-        return
+        return False
 
     # Filter to torch backend for static plots
     backends = {r.get("backend", "torch") for r in data}
@@ -356,13 +362,14 @@ def plot_single_panel(
     else:
         print(f"  Unknown module for {name}")
         plt.close()
-        return
+        return False
 
     plt.tight_layout()
     output_path.parent.mkdir(parents=True, exist_ok=True)
     plt.savefig(output_path, dpi=150, bbox_inches="tight")
     plt.close()
     print(f"Saved: {output_path}")
+    return True
 
 
 def detect_module_mode(name: str) -> tuple[str | None, str | None]:
@@ -670,7 +677,11 @@ def _render_nl_batch(
                     if family == "cluster_tile"
                     else "-"
                 ),
-                marker="s" if family == "naive" else "^" if family == "cluster_tile" else "o",
+                marker="s"
+                if family == "naive"
+                else "^"
+                if family == "cluster_tile"
+                else "o",
                 label=f"{method_str:<7s}  N={format_num(aps)}",
             )
 
@@ -743,7 +754,11 @@ def _render_nl_by_cutoff(
                     if family == "cluster_tile"
                     else "-"
                 ),
-                marker="s" if family == "naive" else "^" if family == "cluster_tile" else "o",
+                marker="s"
+                if family == "naive"
+                else "^"
+                if family == "cluster_tile"
+                else "o",
                 label=format_legend_label(_nl_method_label(method), cutoff),
             )
 

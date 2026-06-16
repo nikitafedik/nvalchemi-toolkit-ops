@@ -1509,6 +1509,32 @@ def _generate_dynamics_backend_plots(
         print(f"      Generated: {output_path.name}")
 
 
+def generate_suite_csv_plots(results_dir: Path, output_dir: Path) -> None:
+    """Generate docs panels from the unified suite's standardized CSV names."""
+    try:
+        from benchmarks.plotting.plot_benchmarks import plot_single_panel
+    except ImportError as exc:
+        print(f"Skipping suite CSV plots: {exc}")
+        return
+
+    csv_files = []
+    for pattern in ("nl-*.csv", "d3-*.csv", "el-*.csv"):
+        csv_files.extend(sorted(results_dir.glob(pattern)))
+
+    if not csv_files:
+        print("No unified suite CSV files found")
+        return
+
+    print(f"\nGenerating unified suite plots ({len(csv_files)} CSVs)...")
+    for csv_file in csv_files:
+        for panel in ("time", "throughput", "memory"):
+            output_path = output_dir / f"{csv_file.stem}-{panel}.png"
+            if plot_single_panel(csv_file, panel, output_path):
+                print(f"      Generated: {output_path.name}")
+            else:
+                print(f"      Skipped: {csv_file.name} ({panel}, no data)")
+
+
 def main() -> None:
     """Generate all plots from benchmark results."""
     print("Generating benchmark plots...")
@@ -1524,6 +1550,7 @@ def main() -> None:
     output_dir.mkdir(exist_ok=True)
 
     # Generate plots for each benchmark type
+    generate_suite_csv_plots(results_dir, output_dir)
     generate_nl_plots(results_dir, output_dir)
     generate_dftd3_plots(results_dir, output_dir)
     generate_electrostatics_plots(results_dir, output_dir)

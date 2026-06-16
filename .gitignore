@@ -83,6 +83,8 @@ venv.bak/
 *.csv
 *.log
 *.cif
+benchmarks/nh3/ammonia_pbc_*.inp
+benchmarks/nh3/ammonia_pbc_*.pdb
 
 # GPU profiling
 nsight-systems*

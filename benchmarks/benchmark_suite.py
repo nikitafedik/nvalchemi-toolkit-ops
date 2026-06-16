@@ -93,7 +93,8 @@ def validate_backend_selection(backend: str | None, benchmarks: set[str]) -> Non
             f"Backend {backend!r} is not supported for requested benchmark(s): "
             f"{', '.join(unsupported)}. Supported backends: "
             + ", ".join(
-                f"{key}={sorted(SUPPORTED_BACKENDS[key])}" for key in sorted(unsupported)
+                f"{key}={sorted(SUPPORTED_BACKENDS[key])}"
+                for key in sorted(unsupported)
             )
         )
 
@@ -122,6 +123,22 @@ def _count_successful_rows(results: list[dict]) -> int:
 def _labels_with_no_rows(summary: dict[str, int]) -> list[str]:
     """Return benchmark labels that produced no rows."""
     return sorted(label for label, count in summary.items() if count <= 0)
+
+
+def _suite_needs_jax_env(args: argparse.Namespace, benchmarks: set[str]) -> bool:
+    """Return True when CLI or selected YAML configs request the JAX backend."""
+    if args.backend == "jax":
+        return True
+    if args.backend is not None:
+        return False
+    for key in benchmarks:
+        config_path = RUNNERS[key]["config"]
+        if not config_path.exists():
+            continue
+        config = load_yaml_config(config_path)
+        if config.get("runtime", {}).get("backend") == "jax":
+            return True
+    return False
 
 
 def parse_args():
@@ -206,7 +223,7 @@ def main():
     # Python process in the suite, so JAX commits to whatever x64 was
     # when NL ran first. Set it unconditionally when any JAX benchmark
     # is queued so the env is consistent regardless of module order.
-    if args.backend == "jax":
+    if _suite_needs_jax_env(args, benchmarks):
         os.environ.setdefault("JAX_ENABLE_X64", "1")
         os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
 
@@ -396,8 +413,12 @@ def _generate_plots(results_dir, plots=None):
             attempted += 1
             try:
                 out = single_dir / f"{csv.stem}-{panel}.png"
-                plot_single_panel(csv, panel, out)
-                succeeded += 1
+                if plot_single_panel(csv, panel, out):
+                    succeeded += 1
+                else:
+                    msg = f"single {csv.stem}-{panel}: no successful data"
+                    plot_errors.append(msg)
+                    print(f"  ERROR ({msg})")
             except Exception as e:
                 msg = f"single {csv.stem}-{panel}: {e}"
                 plot_errors.append(msg)
