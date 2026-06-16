@@ -707,8 +707,9 @@ def configs_for_mode(
         NH3 PDB directory (see :func:`resolve_nh3_dir`). Ignored for CsCl.
     plan_only : bool, default=False
         If True, synthesize NH3 configs from YAML atom counts without requiring
-        generated PDB files. Actual benchmark runs keep the stricter PDB-backed
-        path so they never execute against placeholder systems.
+        generated PDB files. Actual benchmark runs prefer the PDB-backed path;
+        if generated PDBs are missing, they fall back to these planned configs
+        so runners can emit explicit ``success=False`` rows instead of aborting.
 
     Returns
     -------
@@ -718,33 +719,63 @@ def configs_for_mode(
     """
     atom_counts = sys_config.get("atom_counts", [])
     constant_atoms_sizes = sys_config.get("constant_atoms_sizes", [1024, 8192])
-    if plan_only and sys_name == "nh3":
-        if mode_name == "system_size":
-            return [
-                {"num_atoms": n, "pdb_path": None, "batch_size": 1}
-                for n in atom_counts
-            ]
-        if mode_name == "constant_workload":
-            target_atoms = mode_config["target_atoms"]
-            return [
-                {
-                    "num_atoms": n,
-                    "pdb_path": None,
-                    "batch_size": target_atoms // n,
-                }
-                for n in atom_counts
-                if target_atoms // n >= 1
-            ]
-        if mode_name == "batch_scaling":
-            configs = []
-            for n in constant_atoms_sizes:
-                for batch_size in (1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024):
-                    if n * batch_size > mode_config["max_total_atoms"]:
-                        break
-                    configs.append(
-                        {"num_atoms": n, "pdb_path": None, "batch_size": batch_size}
-                    )
-            return configs
+    if sys_name == "nh3":
+        nh3_missing = False
+        if not plan_only:
+            try:
+                find_nh3_pdbs(nh3_dir)
+            except FileNotFoundError:
+                nh3_missing = True
+        if plan_only or nh3_missing:
+            if nh3_missing:
+                nh3_path = Path(nh3_dir or DEFAULT_NH3_DIR)
+                print(
+                    f"  WARNING: no NH3 PDB files in {nh3_path}; "
+                    "recording planned failures"
+                )
+            if mode_name == "system_size":
+                return [
+                    {"num_atoms": n, "pdb_path": None, "batch_size": 1}
+                    for n in atom_counts
+                ]
+            if mode_name == "constant_workload":
+                target_atoms = mode_config["target_atoms"]
+                return [
+                    {
+                        "num_atoms": n,
+                        "pdb_path": None,
+                        "batch_size": target_atoms // n,
+                    }
+                    for n in atom_counts
+                    if target_atoms // n >= 1
+                ]
+            if mode_name == "batch_scaling":
+                configs = []
+                for n in constant_atoms_sizes:
+                    for batch_size in (
+                        1,
+                        2,
+                        4,
+                        8,
+                        16,
+                        32,
+                        64,
+                        128,
+                        256,
+                        512,
+                        1024,
+                    ):
+                        if n * batch_size > mode_config["max_total_atoms"]:
+                            break
+                        configs.append(
+                            {
+                                "num_atoms": n,
+                                "pdb_path": None,
+                                "batch_size": batch_size,
+                            }
+                        )
+                return configs
+
     if mode_name == "system_size":
         return list(get_system_size_configs(sys_name, atom_counts, nh3_dir))
     if mode_name == "constant_workload":

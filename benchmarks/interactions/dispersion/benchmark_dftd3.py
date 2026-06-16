@@ -109,6 +109,32 @@ def _torch_d3_params_to_jax(torch_params, jnp):
     return out
 
 
+def _torch_d3_params_to_device(torch_params, device: str):
+    """Move torch D3 parameter tensors to the selected backend device."""
+    return {
+        key: value.to(device) if torch.is_tensor(value) else value
+        for key, value in torch_params.items()
+    }
+
+
+def _cutoff_limit(cutoff_limits: dict, cutoff: float) -> int | None:
+    """Return the configured total-atom cap for ``cutoff`` if one exists."""
+    return cutoff_limits.get(cutoff) or cutoff_limits.get(str(cutoff))
+
+
+def _all_cutoffs_limited(
+    cutoffs: list[float],
+    cutoff_limits: dict,
+    total_atoms: int,
+) -> bool:
+    """Return True when every cutoff is policy-skipped for ``total_atoms``."""
+    return bool(cutoffs) and all(
+        (limit := _cutoff_limit(cutoff_limits, cutoff)) is not None
+        and total_atoms > limit
+        for cutoff in cutoffs
+    )
+
+
 # =============================================================================
 # Config Loading
 # =============================================================================
@@ -541,14 +567,14 @@ def run_from_config(
         print(f"ERROR: D3 parameters not found at {d3_params_path}")
         print("Run: python examples/dispersion/01_dftd3_molecule.py (downloads params)")
         return []
-    d3_params_torch = torch.load(d3_params_path, map_location="cuda", weights_only=True)
+    d3_params_torch = torch.load(d3_params_path, map_location="cpu", weights_only=True)
     print(f"Loaded D3 parameters from {d3_params_path}")
 
     if backend == "jax":
         jax_api = lazy_import_jax(need_dispersion=True)  # fail fast if jax missing
         d3_params = _torch_d3_params_to_jax(d3_params_torch, jax_api["jnp"])
     else:
-        d3_params = d3_params_torch
+        d3_params = _torch_d3_params_to_device(d3_params_torch, "cuda")
 
     if output_dir is None:
         output_dir = create_run_directory(config["output"]["base_dir"], prefix="d3")
@@ -624,6 +650,30 @@ def run_from_config(
 
             for cfg in configs:
                 n, bs = cfg["num_atoms"], cfg["batch_size"]
+                planned_n, planned_bs, planned_total = planned_atom_counts(
+                    sys_name, cfg
+                )
+                planned_row_meta = make_row_meta(
+                    sys_name,
+                    mode_name,
+                    backend,
+                    planned_n,
+                    planned_bs,
+                    planned_total,
+                )
+                if _all_cutoffs_limited(cutoffs, cutoff_limits, planned_total):
+                    for cutoff in cutoffs:
+                        limit = _cutoff_limit(cutoff_limits, cutoff)
+                        print(f"    {cutoff}Å: SKIP (>{format_num(limit)} limit)")
+                        results.append(
+                            build_skipped_result(
+                                method="dftd3",
+                                cutoff=cutoff,
+                                reason=f">{limit} cutoff_limit",
+                                **planned_row_meta,
+                            )
+                        )
+                    continue
 
                 try:
                     data = create_system(
@@ -635,6 +685,16 @@ def run_from_config(
                     )
                 except (FileNotFoundError, RuntimeError, ValueError) as e:
                     print(f"    SKIP: {e}")
+                    results.extend(
+                        build_failure_result(
+                            method="dftd3",
+                            cutoff=cutoff,
+                            error=str(e),
+                            error_type=type(e).__name__,
+                            **planned_row_meta,
+                        )
+                        for cutoff in cutoffs
+                    )
                     continue
 
                 try:
@@ -654,9 +714,7 @@ def run_from_config(
                     )
 
                     for cutoff in cutoffs:
-                        limit = cutoff_limits.get(cutoff) or cutoff_limits.get(
-                            str(cutoff)
-                        )
+                        limit = _cutoff_limit(cutoff_limits, cutoff)
                         if limit and actual_total > limit:
                             print(f"    {cutoff}Å: SKIP (>{format_num(limit)} limit)")
                             results.append(
@@ -734,8 +792,13 @@ def main():
     if backend == "jax":
         ensure_jax_available(need_dispersion=True)
 
-    run_from_config(config, output_dir=args.output_dir, backend=backend)
+    results = run_from_config(config, output_dir=args.output_dir, backend=backend)
+    if not results:
+        return 1
+    if not any(row.get("success", True) is not False for row in results):
+        return 1
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

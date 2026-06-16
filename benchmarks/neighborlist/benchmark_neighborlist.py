@@ -158,11 +158,6 @@ def _nl_supported_methods(methods: list[str]) -> tuple[list[str], list[str]]:
 def _nl_method_for_case(method: str, batch_size: int, explicit: bool) -> str | None:
     """Resolve a configured NL method to the concrete API for this batch shape."""
     method = normalize_method_name(method)
-    if explicit:
-        is_batch = method.startswith("batch_")
-        if batch_size == 1 or is_batch:
-            return method
-        return None
     if batch_size == 1:
         return method.removeprefix("batch_")
     if method.startswith("batch_"):
@@ -174,6 +169,31 @@ def _nl_method_for_case(method: str, batch_size: int, explicit: bool) -> str | N
     if method == "naive_neighbor_list":
         return "batch_naive_neighbor_list"
     return method
+
+
+def _nl_backend_skip_reason(backend: str, method: str) -> str:
+    """Return a policy-skip reason for backend/method pairs not runnable here."""
+    if backend == "warp" and method in _CLUSTER_TILE_METHODS:
+        return "warp backend does not support cluster_tile"
+    return ""
+
+
+def _cutoff_limit(cutoff_limits: dict, cutoff: float) -> int | None:
+    """Return the configured total-atom cap for ``cutoff`` if one exists."""
+    return cutoff_limits.get(cutoff) or cutoff_limits.get(str(cutoff))
+
+
+def _all_cutoffs_limited(
+    cutoffs: list[float],
+    cutoff_limits: dict,
+    total_atoms: int,
+) -> bool:
+    """Return True when every cutoff is policy-skipped for ``total_atoms``."""
+    return bool(cutoffs) and all(
+        (limit := _cutoff_limit(cutoff_limits, cutoff)) is not None
+        and total_atoms > limit
+        for cutoff in cutoffs
+    )
 
 
 def _resolved_methods_for_case(
@@ -201,9 +221,7 @@ def _require_warp_tile_api(method: str) -> None:
         ) from exc
 
     missing = [
-        name
-        for name in _REQUIRED_WARP_TILE_BUILTINS
-        if not hasattr(wp_builtins, name)
+        name for name in _REQUIRED_WARP_TILE_BUILTINS if not hasattr(wp_builtins, name)
     ]
     if missing:
         raise RuntimeError(
@@ -880,11 +898,13 @@ def dry_run_from_config(config: dict, backend: str | None = None) -> list[dict]:
                     methods, batch_size, explicit
                 )
                 for cutoff in cutoffs:
-                    limit = cutoff_limits.get(cutoff) or cutoff_limits.get(str(cutoff))
+                    limit = _cutoff_limit(cutoff_limits, cutoff)
                     for method in resolved_methods:
                         reason = ""
                         if limit and total_atoms > limit:
                             reason = f">{limit} cutoff_limit"
+                        elif _nl_backend_skip_reason(backend, method):
+                            reason = _nl_backend_skip_reason(backend, method)
                         rows.append(
                             {
                                 "benchmark": "nl",
@@ -1042,6 +1062,52 @@ def run_from_config(
 
             for cfg in configs:
                 n, bs = cfg["num_atoms"], cfg["batch_size"]
+                planned_n, planned_bs, planned_total = planned_atom_counts(
+                    sys_name, cfg
+                )
+                planned_row_meta = make_row_meta(
+                    sys_name,
+                    mode_name,
+                    backend,
+                    planned_n,
+                    planned_bs,
+                    planned_total,
+                )
+                planned_methods = _resolved_methods_for_case(
+                    methods,
+                    planned_bs,
+                    explicit_methods,
+                )
+                if planned_methods and all(
+                    _nl_backend_skip_reason(backend, method)
+                    for method in planned_methods
+                ):
+                    for cutoff in cutoffs:
+                        results.extend(
+                            build_skipped_result(
+                                method=method,
+                                cutoff=cutoff,
+                                reason=_nl_backend_skip_reason(backend, method),
+                                **planned_row_meta,
+                            )
+                            for method in planned_methods
+                        )
+                    continue
+                if _all_cutoffs_limited(cutoffs, cutoff_limits, planned_total):
+                    for cutoff in cutoffs:
+                        limit = _cutoff_limit(cutoff_limits, cutoff)
+                        print(f"    {cutoff}Å: SKIP (>{format_num(limit)} limit)")
+                        reason = f">{limit} cutoff_limit"
+                        results.extend(
+                            build_skipped_result(
+                                method=method,
+                                cutoff=cutoff,
+                                reason=reason,
+                                **planned_row_meta,
+                            )
+                            for method in planned_methods
+                        )
+                    continue
 
                 clean_gpu()
 
@@ -1055,6 +1121,17 @@ def run_from_config(
                     )
                 except (FileNotFoundError, RuntimeError, ValueError) as e:
                     print(f"    SKIP: {e}")
+                    results.extend(
+                        build_failure_result(
+                            method=method,
+                            cutoff=cutoff,
+                            error=str(e),
+                            error_type=type(e).__name__,
+                            **planned_row_meta,
+                        )
+                        for cutoff in cutoffs
+                        for method in planned_methods
+                    )
                     continue
 
                 actual_total = data.get("total_atoms", data["atoms_per_system"])
@@ -1078,7 +1155,7 @@ def run_from_config(
                 )
 
                 for cutoff in cutoffs:
-                    limit = cutoff_limits.get(cutoff) or cutoff_limits.get(str(cutoff))
+                    limit = _cutoff_limit(cutoff_limits, cutoff)
                     if limit and actual_total > limit:
                         print(f"    {cutoff}Å: SKIP (>{format_num(limit)} limit)")
                         reason = f">{limit} cutoff_limit"
@@ -1101,6 +1178,18 @@ def run_from_config(
                         )
 
                     for method in resolved_methods:
+                        reason = _nl_backend_skip_reason(backend, method)
+                        if reason:
+                            print(f"    {cutoff}Å {method}: SKIP - {reason}")
+                            results.append(
+                                build_skipped_result(
+                                    method=method,
+                                    cutoff=cutoff,
+                                    reason=reason,
+                                    **row_meta,
+                                )
+                            )
+                            continue
                         result = _nl_run_one_method(
                             data,
                             cutoff,
@@ -1182,8 +1271,13 @@ def main():
     if backend == "jax":
         ensure_jax_available()
 
-    run_from_config(config, output_dir=args.output_dir, backend=backend)
+    results = run_from_config(config, output_dir=args.output_dir, backend=backend)
+    if not results:
+        return 1
+    if not any(row.get("success", True) is not False for row in results):
+        return 1
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

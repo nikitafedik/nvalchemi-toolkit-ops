@@ -580,6 +580,9 @@ def build_result(
     time_us_per_atom = (time_seconds * 1e6) / total_atoms if total_atoms > 0 else 0.0
     throughput_atoms_per_sec = total_atoms / time_seconds if time_seconds > 0 else 0.0
 
+    error = extra.pop("error", "")
+    error_type = extra.pop("error_type", "")
+
     result = {
         # Identity
         "system": system,
@@ -598,6 +601,8 @@ def build_result(
         "mem_peak_gb": mem_info["mem_peak_gb"],
         # Status
         "success": success,
+        "error": error,
+        "error_type": error_type,
     }
 
     # Add any extra method-specific fields (cutoff, accuracy, time_d3_us_per_atom)
@@ -642,10 +647,9 @@ def build_skipped_result(
 def save_results(results: list[dict], output_path: Path | str) -> None:
     """Save benchmark results to CSV.
 
-    If ``output_path`` already exists and its header matches ``results`` field
-    names, new rows are appended. This lets torch and jax runs share one
-    output directory without clobbering each other. If the existing header
-    differs, the file is overwritten fresh.
+    If ``output_path`` already exists, new rows are appended. When older rows
+    have a narrower schema, the file is rewritten once with the union of
+    existing and new columns so prior benchmark data is preserved.
 
     Parameters
     ----------
@@ -661,22 +665,37 @@ def save_results(results: list[dict], output_path: Path | str) -> None:
         print(f"No results to save to {output_path}")
         return
 
-    fieldnames = []
+    fieldnames: list[str] = []
     for result in results:
         for key in result:
             if key not in fieldnames:
                 fieldnames.append(key)
 
-    # Append if existing file has same schema, else overwrite fresh
     if output_path.exists():
         with open(output_path, newline="") as f:
-            existing_fields = csv.DictReader(f).fieldnames or []
-        if list(existing_fields) == fieldnames:
+            reader = csv.DictReader(f)
+            existing_fields = reader.fieldnames or []
+            existing_rows = list(reader)
+
+        combined_fields = list(existing_fields)
+        for field in fieldnames:
+            if field not in combined_fields:
+                combined_fields.append(field)
+
+        if combined_fields == list(existing_fields):
             with open(output_path, "a", newline="") as f:
-                writer = csv.DictWriter(f, fieldnames=fieldnames)
+                writer = csv.DictWriter(f, fieldnames=combined_fields)
                 writer.writerows(results)
             print(f"Appended {len(results)} results to {output_path}")
             return
+
+        with open(output_path, "w", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=combined_fields)
+            writer.writeheader()
+            writer.writerows(existing_rows)
+            writer.writerows(results)
+        print(f"Appended {len(results)} results to {output_path}")
+        return
 
     with open(output_path, "w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
