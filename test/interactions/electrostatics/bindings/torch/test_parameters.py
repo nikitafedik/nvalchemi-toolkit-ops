@@ -114,6 +114,22 @@ class TestCountAtomsPerSystem:
         assert counts[1].item() == 5
         assert counts[2].item() == 7
 
+    @pytest.mark.parametrize("device", [torch.device("cpu"), torch.device("cuda:0")])
+    @pytest.mark.parametrize("batch_dtype", [torch.int32, torch.int64])
+    def test_batch_index_dtype_compatibility(self, device, batch_dtype):
+        """Test atom counting accepts int32 and int64 batch indices."""
+        positions = torch.randn(8, 3, device=device)
+        batch_idx = torch.tensor(
+            [0, 0, 1, 1, 1, 2, 2, 2],
+            dtype=batch_dtype,
+            device=device,
+        )
+
+        counts = _count_atoms_per_system(positions, num_systems=3, batch_idx=batch_idx)
+
+        assert counts.tolist() == [2, 3, 3]
+        assert counts.dtype == torch.int32
+
 
 class TestEstimateEwaldParameters:
     """Tests for estimate_ewald_parameters function."""

@@ -1,72 +1,119 @@
-# Neighbor List Benchmark Results
+---
+orphan: true
+---
 
-This directory contains pre-computed benchmark results for different neighbor list algorithms
-on various GPU hardware.
+# Benchmark Results
 
-## File Naming Convention
+Pre-computed CSVs consumed by the Sphinx docs build. The shipped numbers
+under this directory were produced on an **NVIDIA H100 80 GB HBM3
+(Hopper)** and cover three modules (neighbor list, DFT-D3 dispersion,
+electrostatics) across two chemical systems (CsCl, NH₃) and three
+scaling modes.
 
-Results are stored in CSV files with the following naming pattern:
+See the per-module doc pages for how to read the plots and how to
+reproduce:
 
-```bash
-neighbor_list_benchmark_<method>_<gpu_sku>.csv
+- `../neighborlist.md`
+- `../dftd3.md`
+- `../electrostatics.md`
+
+## File naming
+
+Names follow the scheme emitted by
+`benchmarks.suite_utils.make_csv_name(module, system, mode)`:
+
+```text
+{module}-{system}-{mode-slug}.csv
 ```
 
-Where:
+Where `module` ∈ `{nl, d3, el}`, `system` ∈ `{cscl, nh3}`, and
+`mode-slug` ∈ `{system-size-scaling, constant-workload-scaling,
+batch-scaling}`. Example: `nl-cscl-system-size-scaling.csv`.
 
-- `<method>`: The neighbor list algorithm (`naive`, `cell_list`, `batch_naive`, `batch_cell_list`)
-- `<gpu_sku>`: GPU identifier (e.g., `rtx_a3000_laptop_gpu`, `a100_sxm4_80gb`)
+The current NL/D3/EL suite uses only root-level `nl-*.csv`, `d3-*.csv`,
+and `el-*.csv` files. Legacy dynamics and segment-operation CSVs may also
+remain at the root for their own docs pages. Archived pre-suite NL/D3/EL
+comparison CSVs remain under `archive/` and are not read by the current suite
+plot generation path.
 
-## Running Benchmarks
+## CSV schema
 
-To generate new benchmark results:
+Emitted by `benchmarks.suite_utils.build_result`:
+
+| Column | Type | Description |
+|---|---|---|
+| `system` | str | `cscl` or `nh3` |
+| `scaling_mode` | str | `system_size`, `constant_workload`, or `batch_scaling` |
+| `method` | str | NL strategy (`naive_scalar`, `naive_tile`, `cell_list_atom_centric`, `cell_list_pair_centric`, `cluster_tile`, plus batch-prefixed concrete APIs where applicable), `dftd3` (D3), or `pme` / `pme_cg` / `ewald` / `ewald_cg` (EL) |
+| `backend` | str | `torch`, `jax`, or `warp` where supported |
+| `atoms_per_system` | int | Atoms in one system |
+| `batch_size` | int | Number of systems in the batch |
+| `total_atoms` | int | `atoms_per_system` × `batch_size` |
+| `time_us_per_atom` | float | Mean μs per atom across the batch timing |
+| `throughput_atoms_per_sec` | float | Derived throughput |
+| `mem_delta_mb` | float | Memory delta from the pre-timing measurement call (MB); NaN for JAX |
+| `mem_peak_gb` | float | Peak GPU memory (GB); NaN for JAX |
+| `timing_runs` | int | Number of timed calls represented by the row |
+| `warmup_runs` | int | Number of untimed warmup calls before measurement |
+| `timing_method` | str | Timing path used for the row, such as `torch_cuda_events` or `jax_wall_block_until_ready` |
+| `timing_method_real` | str | Added by EL for real-space timing paths |
+| `timing_method_reciprocal` | str | Added by EL for reciprocal-space timing paths |
+| `compile_policy` | str | Compile/warmup policy; shipped rows use `warmup_excluded` |
+| `success` | bool | `False` rows are filtered by the plotter |
+| `error` | str | Concise failure or skip message for `success=False` rows |
+| `error_type` | str | Stable failure class, such as `OutOfMemoryError`, `SkippedByPolicy`, or `SkippedAfterOOM` |
+| `cutoff` | float | Added by NL and D3 |
+| `accuracy` | float | Added by EL |
+| `time_d3_us_per_atom` | float | Added by D3 (excludes NL build time) |
+| `time_real_us_per_atom` | float | Added by EL for real-space timing breakdowns |
+| `time_reciprocal_us_per_atom` | float | Added by EL for reciprocal-space timing breakdowns |
+| `backend_comparable` | bool | Added by NL to mark rows included in backend-comparison plots |
+| `timing_scope` | str | Added by NL to separate backend-comparison rows from coverage-only rows |
+
+When Torch and JAX runs share an output directory, each backend rerun replaces
+only its own rows and preserves the other backend's rows. Failed, skipped, and
+OOM cases are written directly into the main CSV with `success=False`; the
+plotter filters those rows out. The suite no longer writes separate failure
+files.
+
+## Reproducing
+
+Run from the repository root. Module-specific flags are documented on
+each module's doc page; the flags below are common to all three.
 
 ```bash
-cd benchmarks/neighborlist
-python benchmark_neighborlist.py --config benchmark_config.yaml --output-dir ../../docs/benchmarks/benchmark_results
+python -m benchmarks.neighborlist.benchmark_neighborlist \
+    --config benchmarks/neighborlist/benchmark_config.yaml \
+    --output-dir docs/benchmarks/benchmark_results
 ```
 
-### Command Line Options
-
-- `--config`: Path to YAML configuration file (required)
-- `--output-dir`: Output directory for CSV files (default: `../../docs/benchmarks/benchmark_results`)
-- `--methods`: Specific methods to benchmark (e.g., `--methods naive cell_list`)
-- `--gpu-sku`: Override GPU SKU name for output files
-
-### Examples
-
-Run all benchmarks:
+Swap in `benchmarks.interactions.dispersion.benchmark_dftd3` or
+`benchmarks.interactions.electrostatics.benchmark_electrostatics` for
+the other modules, or invoke all three via the unified suite:
 
 ```bash
-python benchmark_neighborlist.py --config benchmark_config.yaml
+python -m benchmarks.benchmark_suite --benchmark all \
+    --run-dir docs/benchmarks/benchmark_results
 ```
 
-Run only specific methods:
+The docs CSVs are reportable benchmark outputs: they use the full configured
+grid, 3 warmups, and 10 timed runs unless an explicit command-line filter is
+shown. Reduced smoke runs should write to a separate output directory.
 
-```bash
-python benchmark_neighborlist.py --config benchmark_config.yaml --methods naive cell_list
-```
+The shipped H100 CSVs were collected as scheduler shards with the same full
+grids and timing protocol. CSV rows record per-benchmark timings, not scheduler
+elapsed time; keep scheduler logs or `RUN_LOG.md` artifacts with any PR report
+that quotes shard wall time. Queue time and environment setup are
+site-dependent and should be reported separately.
 
-Override GPU SKU name:
-
-```bash
-python benchmark_neighborlist.py --config benchmark_config.yaml --gpu-sku custom_gpu_name
-```
-
-## CSV Format
-
-Each CSV file contains the following columns:
-
-- `method`: Algorithm name
-- `total_atoms`: Total number of atoms in the system
-- `atoms_per_system`: Atoms per system (for batch methods)
-- `total_neighbors`: Total number of neighbor pairs found
-- `batch_size`: Batch size (1 for single-system methods)
-- `median_time_us`: Median execution time in microseconds
-- `success`: Whether the benchmark completed successfully (optional)
-- `error`: Error message if benchmark failed (optional)
-- `error_type`: Error type (e.g., "OOM", "Timeout") if failed (optional)
+For the JAX backend, pass `--backend jax`. The runner sets JAX/XLA defaults
+before import unless you already configured them in the environment.
+For D3 on offline clusters, pass `--d3-params-path` to a scratch-local
+`dftd3_parameters.pt` file or pre-populate
+`$XDG_CACHE_HOME/nvalchemiops/dftd3_parameters.pt`.
 
 ## Visualization
 
-The Sphinx documentation automatically discovers and visualizes all CSV files in this directory.
-See the benchmarks section of the documentation for interactive plots and comparisons.
+Sphinx's generate_plots hook reads the standardized NL/D3/EL suite CSVs and
+the legacy dynamics CSVs it knows how to parse, then writes PNGs to
+`../_static/`. The benchmark pages embed those images.

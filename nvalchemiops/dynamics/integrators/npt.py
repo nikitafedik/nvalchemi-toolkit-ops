@@ -1903,8 +1903,8 @@ def compute_barostat_mass(
 
     References
     ----------
-    .. [MTK1994] Martyna, Tobias, Klein, J. Chem. Phys. 101, 4177 (1994)
-    .. [SSM2004] Shinoda, Shiga, Mikami, Phys. Rev. B 69, 134103 (2004)
+    - Martyna, Tobias, Klein, J. Chem. Phys. 101, 4177 (1994).
+    - Shinoda, Shiga, Mikami, Phys. Rev. B 69, 134103 (2004).
     """
     if device is None:
         device = target_temperature.device
@@ -2124,8 +2124,8 @@ def npt_barostat_half_step(
 
     References
     ----------
-    .. [MTK1994] Martyna, Tobias, Klein, J. Chem. Phys. 101, 4177 (1994)
-    .. [SSM2004] Shinoda, Shiga, Mikami, Phys. Rev. B 69, 134103 (2004)
+    - Martyna, Tobias, Klein, J. Chem. Phys. 101, 4177 (1994).
+    - Shinoda, Shiga, Mikami, Phys. Rev. B 69, 134103 (2004).
     """
     if device is None:
         device = cell_velocities.device

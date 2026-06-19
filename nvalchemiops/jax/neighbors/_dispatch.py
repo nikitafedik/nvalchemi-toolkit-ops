@@ -68,11 +68,24 @@ _jax_select_method_f64 = jax_kernel(
 )
 
 
+_TRACER_CONCRETIZATION_ERRORS = tuple(
+    err
+    for err in (
+        getattr(jax.errors, "ConcretizationTypeError", None),
+        getattr(jax.errors, "TracerArrayConversionError", None),
+        getattr(jax.errors, "TracerBoolConversionError", None),
+    )
+    if err is not None
+)
+
+
 def _is_jax_cpu_array(array: jax.Array) -> bool:
     """Return whether ``array`` is backed by a CPU device."""
     try:
         return all(device.platform == "cpu" for device in array.devices())
-    except AttributeError:
+    except _TRACER_CONCRETIZATION_ERRORS:
+        return False
+    except (AttributeError, TypeError):
         return True
 
 
@@ -422,9 +435,16 @@ def _reject_unsupported_cluster_tile_combo(
             "or pass a cell with fully periodic pbc."
         )
     try:
-        all_periodic = bool(jax.device_get(jnp.all(pbc)))
-    except RuntimeError:
-        all_periodic = True
+        all_periodic = bool(np.all(np.asarray(jax.device_get(pbc), dtype=np.bool_)))
+    except Exception as exc:
+        if _TRACER_CONCRETIZATION_ERRORS and isinstance(
+            exc, _TRACER_CONCRETIZATION_ERRORS
+        ):
+            all_periodic = True
+        elif isinstance(exc, RuntimeError):
+            all_periodic = True
+        else:
+            raise
     if not all_periodic:
         raise NotImplementedError(
             "method='cluster_tile' / 'batch_cluster_tile' is "

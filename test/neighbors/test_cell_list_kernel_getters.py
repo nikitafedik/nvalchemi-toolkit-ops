@@ -30,6 +30,7 @@ from nvalchemiops.neighbors.cell_list import (
     pair_centric_launch_size,
     query_cell_list,
 )
+from nvalchemiops.neighbors.cell_list.launchers import _pair_centric_launch_chunks
 
 
 @wp.func
@@ -150,6 +151,24 @@ def test_pair_centric_launch_guard_accepts_small_batched_shape():
 
     assert pair_centric_launch_size(64, n_outer, 64) == 110_592
     assert is_pair_centric_launch_safe(64, n_outer, 64)
+
+
+def test_pair_centric_launch_chunks_oversized_shape():
+    """Oversized explicit pair-centric work is split into safe launches."""
+    total_cells = 65_536
+    n_outer = 9_260
+    block_dim = 64
+    chunks = _pair_centric_launch_chunks(total_cells, n_outer + 1, block_dim)
+
+    assert len(chunks) > 1
+    assert chunks[0] == (0, PAIR_CENTRIC_MAX_LINEAR_LAUNCH - 63)
+    assert sum(dim for _, dim in chunks) == pair_centric_launch_size(
+        total_cells,
+        n_outer,
+        block_dim,
+    )
+    assert all(dim <= PAIR_CENTRIC_MAX_LINEAR_LAUNCH for _, dim in chunks)
+    assert [offset for offset, _ in chunks] == sorted(offset for offset, _ in chunks)
 
 
 def _build_single_smoke_state(device, positions_np, box, cutoff, max_neighbors):

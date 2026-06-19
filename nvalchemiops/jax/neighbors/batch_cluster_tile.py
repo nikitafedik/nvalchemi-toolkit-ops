@@ -122,8 +122,9 @@ def estimate_batch_cluster_tile_list_sizes(
     The ``.item()`` syncs are necessary to size buffers; cache the result
     if calling from a hot loop.
     """
-    num_systems = int(batch_ptr.shape[0]) - 1
-    natom_per_system = (batch_ptr[1:] - batch_ptr[:-1]).astype(jnp.int32)
+    counts = np.asarray(batch_ptr, dtype=np.int64).reshape(-1)
+    num_systems = int(counts.shape[0]) - 1
+    natom_per_system = counts[1:] - counts[:-1]
     natom_padded_per_system = (
         (natom_per_system + TILE_GROUP_SIZE - 1) // TILE_GROUP_SIZE
     ) * TILE_GROUP_SIZE
@@ -952,12 +953,12 @@ _jax_batch_query_cluster_tile_coo_segmented = jax_callable(
 # =============================================================================
 def _make_batch_idx(batch_ptr: jax.Array) -> jax.Array:
     """Build per-atom system index from a batch_ptr (cumulative atom counts)."""
-    num_systems = int(batch_ptr.shape[0]) - 1
-    natom_per_system = (batch_ptr[1:] - batch_ptr[:-1]).astype(jnp.int32)
-    return jnp.repeat(
-        jnp.arange(num_systems, dtype=jnp.int32),
-        natom_per_system,
-        total_repeat_length=int(batch_ptr[-1]),
+    counts = np.asarray(batch_ptr, dtype=np.int64).reshape(-1)
+    num_systems = int(counts.shape[0]) - 1
+    natom_per_system = counts[1:] - counts[:-1]
+    return jnp.asarray(
+        np.repeat(np.arange(num_systems, dtype=np.int32), natom_per_system),
+        dtype=jnp.int32,
     )
 
 

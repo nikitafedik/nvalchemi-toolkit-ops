@@ -224,8 +224,9 @@ def neighbor_list(
             Pre-computed array of shape (3,) for number of cells in x, y, z directions.
             Can be provided to hint buffer reuse to XLA for cell list construction.
         neighbor_search_radius : jax.Array, optional
-            Pre-computed array of shape (3,) for radius of neighboring cells to search
-            in each dimension. Can be provided to hint buffer reuse to XLA for cell list construction.
+            Pre-computed array of shape (3,) or (num_systems, 3) for radius
+            of neighboring cells to search in each dimension. Can be provided
+            to hint buffer reuse to XLA for cell list construction.
         atom_periodic_shifts : jax.Array, optional
             Pre-shaped array of shape (total_atoms, 3) for periodic boundary crossings
             for each atom. Can be provided to hint buffer reuse to XLA for cell list construction.

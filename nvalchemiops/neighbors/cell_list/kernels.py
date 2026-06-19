@@ -1338,6 +1338,7 @@ def _make_pair_centric_kernel(
         pair_energies: wp.array(dtype=wp_dtype, ndim=2),
         pair_forces: wp.array(dtype=vec_dtype, ndim=2),
         block_dim_const: wp.int32,
+        logical_block_offset: wp.int32,
         total_cells: wp.int32,
         n_offsets: wp.int32,
         max_radius: wp.vec3i,
@@ -1397,6 +1398,9 @@ def _make_pair_centric_kernel(
             OUTPUT: Optional pair-function forces. Sentinel when disabled.
         block_dim_const : wp.int32
             Runtime copy of the CUDA block dimension.
+        logical_block_offset : wp.int32
+            Number of logical source-cell/offset blocks skipped by earlier
+            chunked launches.
         total_cells : wp.int32
             Number of global cells to traverse.
         n_offsets : wp.int32
@@ -1423,8 +1427,9 @@ def _make_pair_centric_kernel(
         get_query_cell_list_kernel : Return the specialized pair-centric neighbor-search kernel.
         """
         tid = wp.tid()
-        bid = tid / block_dim_const
-        lane = tid - bid * block_dim_const
+        local_bid = tid / block_dim_const
+        lane = tid - local_bid * block_dim_const
+        bid = logical_block_offset + local_bid
         source_cell = bid / n_offsets
         offset_idx = bid % n_offsets
         if source_cell >= total_cells:

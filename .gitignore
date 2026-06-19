@@ -41,6 +41,7 @@ htmlcov/
 .coverage
 .coverage.*
 .cache
+.tmp/
 nosetests.xml
 coverage.xml
 *.cover
@@ -81,8 +82,14 @@ venv.bak/
 *.tar.gz
 *.png
 *.csv
+!docs/benchmarks/benchmark_results/nl-*.csv
+!docs/benchmarks/benchmark_results/d3-*.csv
+!docs/benchmarks/benchmark_results/el-*.csv
+!docs/benchmarks/benchmark_results/archive/backup_20260617_legacy_d3_el_csvs/*.csv
 *.log
 *.cif
+benchmarks/nh3/ammonia_pbc_*.inp
+benchmarks/nh3/ammonia_pbc_*.pdb
 
 # GPU profiling
 nsight-systems*
@@ -97,6 +104,7 @@ checkpoints/
 # Sphinx documentation
 _build
 docs/_build
+docs/_build*/
 docs/modules/generated
 docs/modules/backreferences
 docs/examples

@@ -33,8 +33,9 @@ Blackwell GPUs require CUDA 13. `torch>=2.11.0` and `jax[cuda13]` publish
 CUDA 13 wheels on the default PyPI index for Linux x86_64 and aarch64. The
 `torch` and `jax` extras use CUDA 13 by default and are equivalent to
 `torch-cu13` and `jax-cu13`. Use `torch-cu12` and `jax-cu12` when a CUDA 12
-environment is required. See the [CUDA 13 installation section](install.md#cuda-13-installation)
-in the installation guide for step-by-step instructions.
+environment is required. See the
+{ref}`CUDA 13 installation section <cuda-13-installation>` in the installation
+guide for step-by-step instructions.
 
 ## Neighbor Lists
 

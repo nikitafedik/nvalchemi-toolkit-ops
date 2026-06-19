@@ -25,11 +25,6 @@ with PyTorch custom operators. It abstracts common patterns for:
 3. Storing tape and warp arrays on output tensors
 4. Retrieving them in backward passes
 5. Decorator-based custom op registration with automatic backward generation
-
-import warp as wp
-import torch
-from contextlib import contextmanager, nullcontext
-from typing import Any, Optional, Sequence, Union
 """
 
 import inspect
@@ -358,6 +353,7 @@ def warp_custom_op(
     """Decorator to create a Warp-backed PyTorch op with compile-safe autograd.
 
     This decorator eliminates boilerplate by automatically generating:
+
     - A ``torch.library.custom_op`` forward registered with fake/meta support
     - A hidden token input for runtime state handoff while the public wrapper
       still exposes only the user-visible signature

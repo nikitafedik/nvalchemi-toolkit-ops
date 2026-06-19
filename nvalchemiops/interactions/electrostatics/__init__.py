@@ -28,30 +28,35 @@ For PyTorch bindings, see ``nvalchemiops.torch.interactions.electrostatics``.
 Available Methods
 -----------------
 
-1. **Coulomb** (`coulomb`)
+1. **Coulomb** (``coulomb``)
+
    - Direct Coulomb energy and forces
    - Damped (erfc) Coulomb for Ewald/PME real-space contribution
    - Warp launchers: ``coulomb_energy()``, ``coulomb_energy_forces()``, etc.
    - PyTorch API: ``nvalchemiops.torch.interactions.electrostatics.coulomb``
 
-2. **Ewald Summation** (`ewald`)
+2. **Ewald Summation** (``ewald``)
+
    - Classical method splitting interactions into real-space and reciprocal-space
    - :math:`O(N^2)` scaling for explicit k-vectors, good for small systems
    - Full autograd support
 
-3. **Particle Mesh Ewald (PME)** (`pme`)
+3. **Particle Mesh Ewald (PME)** (``pme``)
+
    - FFT-based method for :math:`O(N \log N)` scaling
    - Uses B-spline interpolation for charge assignment
    - Full autograd support
 
-4. **Damped Shifted Force (DSF)** (`dsf`)
+4. **Damped Shifted Force (DSF)** (``dsf``)
+
    - Pairwise :math:`O(N)` electrostatic summation
    - Both potential and forces smoothly vanish at cutoff
    - Supports geometry-dependent charges (MLIP)
    - Warp launchers: ``dsf_csr()``, ``dsf_matrix()``
    - PyTorch API: ``nvalchemiops.torch.interactions.electrostatics.dsf``
 
-5. **Slab Correction** (`slab_kernels`)
+5. **Slab Correction** (``slab_kernels``)
+
    - Yeh-Berkowitz / Ballenegger correction for 2D-periodic slabs
    - Supports orthogonal and triclinic cells via projected slab normals
    - Warp launchers: ``slab_reduce_moments()``, ``slab_precompute_geometry()``,

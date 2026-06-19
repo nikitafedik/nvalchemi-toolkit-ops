@@ -101,6 +101,29 @@ def _raise_unsafe_pair_centric_launch(
     raise ValueError(_pair_centric_unsafe_message(total_cells, n_outer, block_dim))
 
 
+def _pair_centric_launch_chunks(
+    total_cells: int,
+    n_offsets: int,
+    block_dim: int,
+) -> list[tuple[int, int]]:
+    """Return ``(logical_block_offset, launch_dim)`` chunks."""
+    block_dim_int = int(block_dim)
+    if block_dim_int <= 0:
+        raise ValueError("block_dim must be positive")
+    total_logical_blocks = int(total_cells) * int(n_offsets)
+    max_blocks_per_launch = max(
+        int(PAIR_CENTRIC_MAX_LINEAR_LAUNCH) // block_dim_int,
+        1,
+    )
+    chunks = []
+    start = 0
+    while start < total_logical_blocks:
+        blocks = min(max_blocks_per_launch, total_logical_blocks - start)
+        chunks.append((start, blocks * block_dim_int))
+        start += blocks
+    return chunks
+
+
 def _prepare_target_row_lookup(
     target_indices: wp.array | None,
     target_row_lookup: wp.array | None,
@@ -574,8 +597,6 @@ def query_cell_list_pair_centric_sorted(
     total_cells = int(atoms_per_cell_count.shape[0])
     block_dim_int = int(block_dim)
     n_offsets_int = int(n_outer) + 1
-    if not is_pair_centric_launch_safe(total_cells, int(n_outer), block_dim_int):
-        _raise_unsafe_pair_centric_launch(total_cells, int(n_outer), block_dim_int)
     partial = target_indices is not None
     target_row_lookup_arg = _prepare_target_row_lookup(
         target_indices,
@@ -612,43 +633,49 @@ def query_cell_list_pair_centric_sorted(
         return_distances=return_distances,
         pair_fn=pair_fn,
     )
-    wp.launch(
-        kernel,
-        dim=total_cells * n_offsets_int * block_dim_int,
-        block_dim=block_dim_int,
-        inputs=[
-            sorted_positions,
-            sorted_atom_periodic_shifts,
-            cell,
-            pbc,
-            _empty_sentinel(2, wp.bool, device),
-            wp_dtype(cutoff),
-            cells_per_dimension,
-            _empty_sentinel(1, wp.vec3i, device),
-            neighbor_search_radius,
-            _empty_sentinel(1, wp.vec3i, device),
-            atoms_per_cell_count,
-            cell_atom_start_indices,
-            cell_atom_list,
-            _empty_sentinel(1, wp.int32, device),
-            _empty_sentinel(1, wp.int32, device),
-            target_row_lookup_arg,
-            neighbor_matrix,
-            neighbor_matrix_shifts,
-            num_neighbors,
-            neighbor_vectors_arg,
-            neighbor_distances_arg,
-            pair_params_arg,
-            pair_energies_arg,
-            pair_forces_arg,
-            block_dim_int,
-            total_cells,
-            n_offsets_int,
-            _ZERO_RADIUS,
-            rebuild_flags,
-        ],
-        device=device,
-    )
+    for logical_block_offset, launch_dim in _pair_centric_launch_chunks(
+        total_cells,
+        n_offsets_int,
+        block_dim_int,
+    ):
+        wp.launch(
+            kernel,
+            dim=launch_dim,
+            block_dim=block_dim_int,
+            inputs=[
+                sorted_positions,
+                sorted_atom_periodic_shifts,
+                cell,
+                pbc,
+                _empty_sentinel(2, wp.bool, device),
+                wp_dtype(cutoff),
+                cells_per_dimension,
+                _empty_sentinel(1, wp.vec3i, device),
+                neighbor_search_radius,
+                _empty_sentinel(1, wp.vec3i, device),
+                atoms_per_cell_count,
+                cell_atom_start_indices,
+                cell_atom_list,
+                _empty_sentinel(1, wp.int32, device),
+                _empty_sentinel(1, wp.int32, device),
+                target_row_lookup_arg,
+                neighbor_matrix,
+                neighbor_matrix_shifts,
+                num_neighbors,
+                neighbor_vectors_arg,
+                neighbor_distances_arg,
+                pair_params_arg,
+                pair_energies_arg,
+                pair_forces_arg,
+                block_dim_int,
+                int(logical_block_offset),
+                total_cells,
+                n_offsets_int,
+                _ZERO_RADIUS,
+                rebuild_flags,
+            ],
+            device=device,
+        )
 
 
 def query_cell_list(
@@ -826,10 +853,6 @@ def query_cell_list(
                 "strategy='pair_centric' requires n_outer.  Compute via "
                 "compute_batch_pair_centric_n_outer((Rx, Ry, Rz), half_fill).",
             )
-        block_dim = 64
-        total_cells = int(atoms_per_cell_count.shape[0])
-        if not is_pair_centric_launch_safe(total_cells, int(n_outer), block_dim):
-            _raise_unsafe_pair_centric_launch(total_cells, int(n_outer), block_dim)
         chosen = "pair_centric"
     else:
         raise ValueError(
@@ -1231,8 +1254,6 @@ def batch_query_cell_list_pair_centric_sorted(
     num_systems = int(cell.shape[0])
     block_dim_int = int(block_dim)
     n_offsets_int = int(n_outer) + 1
-    if not is_pair_centric_launch_safe(int(total_cells), int(n_outer), block_dim_int):
-        _raise_unsafe_pair_centric_launch(int(total_cells), int(n_outer), block_dim_int)
     R_max_vec = wp.vec3i(int(R_max[0]), int(R_max[1]), int(R_max[2]))
     partial = target_indices is not None
     rebuild_flags_arg = (
@@ -1296,43 +1317,49 @@ def batch_query_cell_list_pair_centric_sorted(
         return_distances=return_distances,
         pair_fn=pair_fn,
     )
-    wp.launch(
-        kernel,
-        dim=total_cells * n_offsets_int * block_dim_int,
-        block_dim=block_dim_int,
-        inputs=[
-            sorted_positions,
-            sorted_atom_periodic_shifts,
-            cell,
-            _empty_sentinel(1, wp.bool, device),
-            pbc,
-            wp_dtype(cutoff),
-            _empty_sentinel(1, wp.int32, device),
-            cells_per_dimension,
-            _empty_sentinel(1, wp.int32, device),
-            neighbor_search_radius,
-            atoms_per_cell_count,
-            cell_atom_start_indices,
-            cell_atom_list,
-            cell_offsets,
-            cell_to_system,
-            target_row_lookup_arg,
-            neighbor_matrix,
-            neighbor_matrix_shifts,
-            num_neighbors,
-            neighbor_vectors_arg,
-            neighbor_distances_arg,
-            pair_params_arg,
-            pair_energies_arg,
-            pair_forces_arg,
-            block_dim_int,
-            total_cells,
-            n_offsets_int,
-            R_max_vec,
-            rebuild_flags_arg,
-        ],
-        device=device,
-    )
+    for logical_block_offset, launch_dim in _pair_centric_launch_chunks(
+        int(total_cells),
+        n_offsets_int,
+        block_dim_int,
+    ):
+        wp.launch(
+            kernel,
+            dim=launch_dim,
+            block_dim=block_dim_int,
+            inputs=[
+                sorted_positions,
+                sorted_atom_periodic_shifts,
+                cell,
+                _empty_sentinel(1, wp.bool, device),
+                pbc,
+                wp_dtype(cutoff),
+                _empty_sentinel(1, wp.int32, device),
+                cells_per_dimension,
+                _empty_sentinel(1, wp.int32, device),
+                neighbor_search_radius,
+                atoms_per_cell_count,
+                cell_atom_start_indices,
+                cell_atom_list,
+                cell_offsets,
+                cell_to_system,
+                target_row_lookup_arg,
+                neighbor_matrix,
+                neighbor_matrix_shifts,
+                num_neighbors,
+                neighbor_vectors_arg,
+                neighbor_distances_arg,
+                pair_params_arg,
+                pair_energies_arg,
+                pair_forces_arg,
+                block_dim_int,
+                int(logical_block_offset),
+                total_cells,
+                n_offsets_int,
+                R_max_vec,
+                rebuild_flags_arg,
+            ],
+            device=device,
+        )
 
 
 def batch_query_cell_list(
@@ -1503,9 +1530,6 @@ def batch_query_cell_list(
                 f"metadata): {missing}.  See compute_batch_pair_centric_n_outer "
                 f"for n_outer.",
             )
-        block_dim = 64
-        if not is_pair_centric_launch_safe(int(total_cells), int(n_outer), block_dim):
-            _raise_unsafe_pair_centric_launch(int(total_cells), int(n_outer), block_dim)
     elif strategy != "atom_centric":
         raise ValueError(
             f"strategy must be 'atom_centric' | 'pair_centric', got {strategy!r}",

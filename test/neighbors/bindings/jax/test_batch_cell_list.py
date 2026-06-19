@@ -121,6 +121,71 @@ class TestBatchCellList:
         np.testing.assert_allclose(np.asarray(grad), 0.0)
 
 
+class TestBatchCellListAtomCentricDirect:
+    """Direct and sorted batched atom-centric paths return the same topology."""
+
+    @pytest.mark.parametrize("dtype", [jnp.float32, jnp.float64])
+    def test_direct_matches_sorted(self, dtype):
+        """Direct batched atom-centric queries skip gather without changing pairs."""
+        if dtype == jnp.float64:
+            jax.config.update("jax_enable_x64", True)
+
+        positions = jnp.array(
+            [
+                [0.0, 0.0, 0.0],
+                [1.0, 0.0, 0.0],
+                [0.0, 1.0, 0.0],
+                [0.0, 0.0, 1.0],
+                [0.0, 0.0, 0.0],
+                [1.1, 0.0, 0.0],
+                [0.0, 1.1, 0.0],
+            ],
+            dtype=dtype,
+        )
+        cell = jnp.array(
+            [
+                [[5.0, 0.0, 0.0], [0.0, 5.0, 0.0], [0.0, 0.0, 5.0]],
+                [[6.0, 0.0, 0.0], [0.0, 6.0, 0.0], [0.0, 0.0, 6.0]],
+            ],
+            dtype=dtype,
+        )
+        pbc = jnp.array([[True, True, True], [True, True, True]])
+        batch_idx = jnp.array([0, 0, 0, 0, 1, 1, 1], dtype=jnp.int32)
+        batch_ptr = jnp.array([0, 4, 7], dtype=jnp.int32)
+
+        def neighbor_sets(atom_centric_path):
+            neighbor_matrix, num_neighbors, shifts = batch_cell_list(
+                positions,
+                1.6,
+                cell=cell,
+                pbc=pbc,
+                batch_idx=batch_idx,
+                batch_ptr=batch_ptr,
+                max_neighbors=8,
+                strategy="atom_centric",
+                atom_centric_path=atom_centric_path,
+            )
+            fill_value = positions.shape[0]
+            matrix_np = np.asarray(neighbor_matrix)
+            shifts_np = np.asarray(shifts)
+            sets = []
+            for row, row_shifts in zip(matrix_np, shifts_np, strict=True):
+                sets.append(
+                    frozenset(
+                        (int(neighbor), tuple(int(x) for x in shift))
+                        for neighbor, shift in zip(row, row_shifts, strict=True)
+                        if int(neighbor) != fill_value
+                    )
+                )
+            return sets, np.asarray(num_neighbors)
+
+        sorted_sets, sorted_counts = neighbor_sets("sorted")
+        direct_sets, direct_counts = neighbor_sets("direct")
+
+        assert direct_sets == sorted_sets
+        np.testing.assert_array_equal(direct_counts, sorted_counts)
+
+
 class TestBatchCellListEdgeCases:
     """Edge case tests for batch_cell_list."""
 
@@ -233,10 +298,7 @@ class TestBatchCellListJIT:
                 batch_ptr=batch_ptr,
             )
 
-        with pytest.raises(
-            jax.errors.TracerBoolConversionError,
-            match="Attempted boolean conversion",
-        ):
+        with pytest.raises(ValueError, match="requires concrete cell-list sizing"):
             jitted_batch_cell_list(positions, cells, pbcs, batch_idx, batch_ptr)
 
     def test_jit_with_pbc_precomputed_sizing(self):

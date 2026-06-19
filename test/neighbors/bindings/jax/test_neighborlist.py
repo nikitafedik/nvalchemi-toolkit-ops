@@ -448,6 +448,73 @@ class TestNeighborListExplicitMethod:
         assert len(wrapper_result) == len(direct_result)
         assert_neighbor_matrix_equal_jax(wrapper_result, direct_result)
 
+    def test_explicit_cluster_tile_rejects_concrete_nonperiodic_pbc(self, device):
+        """Concrete non-periodic pbc is rejected before the PBC-implicit kernel."""
+        positions = jnp.zeros((8, 3), dtype=jnp.float32)
+        cell = jnp.eye(3, dtype=jnp.float32) * 8.0
+        pbc = jnp.array([True, False, True])
+
+        with pytest.raises(NotImplementedError, match="pbc with any False"):
+            neighbor_list(
+                positions,
+                1.0,
+                cell=cell,
+                pbc=pbc,
+                method="cluster_tile",
+                max_neighbors=16,
+            )
+
+    def test_explicit_cluster_tile_allows_traced_periodic_pbc(self, device):
+        """Jitted explicit cluster_tile accepts a fully periodic traced pbc."""
+        positions = (
+            jnp.arange(96, dtype=jnp.float32).reshape(32, 3)
+            * jnp.array([0.173, 0.337, 0.491], dtype=jnp.float32)
+        ) % 7.0
+        cell = jnp.eye(3, dtype=jnp.float32) * 8.0
+        pbc = jnp.ones(3, dtype=jnp.bool_)
+
+        @jax.jit
+        def run(pos, pbc_arg):
+            _, num_neighbors, _ = neighbor_list(
+                pos,
+                1.0,
+                cell=cell,
+                pbc=pbc_arg,
+                method="cluster_tile",
+                max_neighbors=64,
+            )
+            return num_neighbors
+
+        assert run(positions, pbc).shape == (positions.shape[0],)
+
+    def test_explicit_batch_cluster_tile_allows_traced_periodic_pbc(self, device):
+        """Jitted explicit batch_cluster_tile accepts fully periodic traced pbc."""
+        base_positions = (
+            jnp.arange(96, dtype=jnp.float32).reshape(32, 3)
+            * jnp.array([0.173, 0.337, 0.491], dtype=jnp.float32)
+        ) % 7.0
+        positions = jnp.concatenate([base_positions, base_positions], axis=0)
+        cell = jnp.repeat((jnp.eye(3, dtype=jnp.float32) * 8.0)[None, :, :], 2, axis=0)
+        pbc = jnp.ones((2, 3), dtype=jnp.bool_)
+        batch_idx = jnp.repeat(jnp.arange(2, dtype=jnp.int32), 32)
+        batch_ptr = jnp.array([0, 32, 64], dtype=jnp.int32)
+
+        @jax.jit
+        def run(pos, pbc_arg):
+            _, num_neighbors, _ = neighbor_list(
+                pos,
+                1.0,
+                cell=cell,
+                pbc=pbc_arg,
+                batch_idx=batch_idx,
+                batch_ptr=batch_ptr,
+                method="batch_cluster_tile",
+                max_neighbors=64,
+            )
+            return num_neighbors
+
+        assert run(positions, pbc).shape == (positions.shape[0],)
+
     @pytest.mark.parametrize(
         ("method", "expected_route", "expected_options"),
         [

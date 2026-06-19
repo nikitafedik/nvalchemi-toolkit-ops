@@ -34,7 +34,7 @@ variant provides improved short-range behavior for molecular geometries.
 ```{important}
 **DFT-D3 parameters must be explicitly provided** via `d3_params` (a
 {class}`~nvalchemiops.torch.interactions.dispersion.D3Parameters` instance or
-dictionary). See [Parameter Setup](parameter-setup) for details.
+dictionary). See {ref}`parameter-setup` for details.
 
 **Unit consistency is required**: Standard D3 parameters use atomic units---
 Bohr for lengths, Hartree for energies. Unit mismatches may cause the neighbor list
@@ -371,6 +371,8 @@ The reference parameter files from the Grimme group already follow this
 convention (index 0 is unused). No special handling is needed when loading
 standard parameters.
 ```
+
+(parameter-setup)=
 
 ## Parameter Setup
 
@@ -831,7 +833,9 @@ Forces include both direct and coordination-dependent contributions via chain ru
 ```
 
 This decomposition into direct and chain-rule terms is central to the multi-pass
-kernel architecture described in [Implementation Details](implementation-details).
+kernel architecture described in {ref}`implementation-details`.
+
+(implementation-details)=
 
 ## Implementation Details
 

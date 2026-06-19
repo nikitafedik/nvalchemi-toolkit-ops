@@ -122,12 +122,6 @@ class MultipoleSCFCache:
     cell : torch.Tensor, float64
         The original unit-cell matrix/matrices. Single ``(3, 3)`` / batched
         ``(B, 3, 3)``.
-    n_systems : int
-        Number of systems: ``1`` for single, ``B`` for batched.
-    valid_k_counts : torch.Tensor or None
-        Batched only: ``(B,)`` int32 of per-system valid k-counts ``K_b``
-        (``K_max = valid_k_counts.max()``). ``None`` for the single-system
-        cache.
     sigma : float
         Density-side Gaussian width.
     alpha : float or None

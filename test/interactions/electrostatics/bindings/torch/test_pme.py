@@ -3856,6 +3856,62 @@ class TestPMEVirialTorchPMEParity:
 ###########################################################################################
 
 
+class TestPMECorrectionBatchIndexDtype:
+    """Validate PME correction helpers with supported batch-index dtypes."""
+
+    @pytest.mark.parametrize("device", ["cuda", "cpu"])
+    def test_batch_corrections_accept_int32_and_int64_batch_idx(self, device):
+        """Batched PME correction scatter paths accept int32 and int64 indices."""
+        if device == "cuda" and not torch.cuda.is_available():
+            pytest.skip("CUDA not available")
+        device = torch.device(device)
+        dtype = torch.float64
+        raw = torch.tensor([0.25, -0.5, 0.125, 0.375], dtype=dtype, device=device)
+        charges = torch.tensor([1.0, -0.25, 0.5, -0.75], dtype=dtype, device=device)
+        cell = torch.stack(
+            [
+                torch.eye(3, dtype=dtype, device=device) * 8.0,
+                torch.eye(3, dtype=dtype, device=device) * 9.0,
+            ]
+        )
+        alpha = torch.tensor([0.35, 0.4], dtype=dtype, device=device)
+        batch_idx_i32 = torch.tensor([0, 0, 1, 1], dtype=torch.int32, device=device)
+        batch_idx_i64 = batch_idx_i32.to(torch.int64)
+
+        corrected_i32 = pme_energy_corrections(
+            raw,
+            charges,
+            cell,
+            alpha,
+            batch_idx=batch_idx_i32,
+        )
+        corrected_i64 = pme_energy_corrections(
+            raw,
+            charges,
+            cell,
+            alpha,
+            batch_idx=batch_idx_i64,
+        )
+        corrected_cg_i32, charge_grad_i32 = pme_energy_corrections_with_charge_grad(
+            raw,
+            charges,
+            cell,
+            alpha,
+            batch_idx=batch_idx_i32,
+        )
+        corrected_cg_i64, charge_grad_i64 = pme_energy_corrections_with_charge_grad(
+            raw,
+            charges,
+            cell,
+            alpha,
+            batch_idx=batch_idx_i64,
+        )
+
+        torch.testing.assert_close(corrected_i32, corrected_i64)
+        torch.testing.assert_close(corrected_cg_i32, corrected_cg_i64)
+        torch.testing.assert_close(charge_grad_i32, charge_grad_i64)
+
+
 class TestPMETorchCompile:
     """Verify that PME functions work correctly under torch.compile."""
 

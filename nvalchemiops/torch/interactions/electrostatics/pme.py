@@ -1548,12 +1548,14 @@ def pme_energy_corrections(
         total_charges = torch.zeros(
             num_systems, dtype=input_dtype, device=raw_energies.device
         )
-        total_charges.scatter_add_(0, batch_idx, charges.to(input_dtype))
+        scatter_idx = batch_idx.to(torch.int64)
+        batch_idx_i32 = batch_idx.to(torch.int32)
+        total_charges.scatter_add_(0, scatter_idx, charges.to(input_dtype))
 
         result = _batch_pme_energy_corrections(
             raw_energies,
             charges.to(input_dtype),
-            batch_idx,
+            batch_idx_i32,
             volumes,
             alpha.to(input_dtype),
             total_charges,
@@ -1633,12 +1635,14 @@ def pme_energy_corrections_with_charge_grad(
         total_charges = torch.zeros(
             num_systems, dtype=input_dtype, device=raw_energies.device
         )
-        total_charges.scatter_add_(0, batch_idx, charges.to(input_dtype))
+        scatter_idx = batch_idx.to(torch.int64)
+        batch_idx_i32 = batch_idx.to(torch.int32)
+        total_charges.scatter_add_(0, scatter_idx, charges.to(input_dtype))
 
         return _batch_pme_energy_corrections_with_charge_grad(
             raw_energies,
             charges.to(input_dtype),
-            batch_idx,
+            batch_idx_i32,
             volumes,
             alpha.to(input_dtype),
             total_charges,

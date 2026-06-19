@@ -43,16 +43,13 @@ import torch
 import warp as wp
 
 from nvalchemiops.neighbors.cell_list import (
-    PAIR_CENTRIC_MAX_LINEAR_LAUNCH,
-    compute_batch_pair_centric_n_outer,
-    get_build_cell_list_kernel,
-    is_pair_centric_launch_safe,
-    is_pair_centric_parallelism_sufficient,
-    pair_centric_launch_size,
-    select_cell_list_strategy,
+    build_cell_list as wp_build_cell_list,
 )
 from nvalchemiops.neighbors.cell_list import (
-    build_cell_list as wp_build_cell_list,
+    compute_batch_pair_centric_n_outer,
+    get_build_cell_list_kernel,
+    is_pair_centric_parallelism_sufficient,
+    select_cell_list_strategy,
 )
 from nvalchemiops.neighbors.cell_list import (
     query_cell_list as wp_query_cell_list,
@@ -87,31 +84,6 @@ __all__ = [
     "estimate_cell_list_sizes",
     "query_cell_list",
 ]
-
-
-def _pair_centric_unsafe_message(
-    total_cells: int,
-    n_outer: int,
-    block_dim: int = 64,
-) -> str:
-    """Return the unsafe pair-centric launch message."""
-    launch_size = pair_centric_launch_size(total_cells, n_outer, block_dim)
-    return (
-        "strategy='pair_centric' would require "
-        f"{launch_size} logical threads "
-        f"({int(total_cells)} cells * {int(n_outer) + 1} offsets * "
-        f"{int(block_dim)} threads), exceeding the safe linear launch limit "
-        f"of {PAIR_CENTRIC_MAX_LINEAR_LAUNCH}."
-    )
-
-
-def _raise_unsafe_pair_centric_launch(
-    total_cells: int,
-    n_outer: int,
-    block_dim: int = 64,
-) -> None:
-    """Raise when an explicit pair-centric request is unsafe."""
-    raise ValueError(_pair_centric_unsafe_message(total_cells, n_outer, block_dim))
 
 
 def _resolve_atom_centric_path(atom_centric_path: str) -> str:
@@ -649,13 +621,9 @@ def _query_cell_list_op(
         Rz = int(neighbor_search_radius[2].item())
         n_outer = compute_batch_pair_centric_n_outer((Rx, Ry, Rz), bool(half_fill))
         total_cells = int(atoms_per_cell_count.shape[0])
-        if not is_pair_centric_launch_safe(total_cells, n_outer):
-            if strategy == "pair_centric":
-                _raise_unsafe_pair_centric_launch(total_cells, n_outer)
-            chosen = "atom_centric"
-            use_pair = False
-            n_outer = None
-        elif strategy == "auto" and not is_pair_centric_parallelism_sufficient(
+        # The Warp launcher chunks oversized logical pair grids; only auto
+        # dispatch uses this performance heuristic to avoid underfilled work.
+        if strategy == "auto" and not is_pair_centric_parallelism_sufficient(
             int(total_atoms), total_cells, n_outer
         ):
             chosen = "atom_centric"
@@ -1454,12 +1422,9 @@ def _query_cell_list_optional(
         Rz = int(neighbor_search_radius[2].item())
         n_outer = compute_batch_pair_centric_n_outer((Rx, Ry, Rz), bool(half_fill))
         total_cells = int(atoms_per_cell_count.shape[0])
-        if not is_pair_centric_launch_safe(total_cells, n_outer):
-            if strategy == "pair_centric":
-                _raise_unsafe_pair_centric_launch(total_cells, n_outer)
-            chosen = "atom_centric"
-            n_outer = None
-        elif strategy == "auto" and not is_pair_centric_parallelism_sufficient(
+        # The Warp launcher chunks oversized logical pair grids; only auto
+        # dispatch uses this performance heuristic to avoid underfilled work.
+        if strategy == "auto" and not is_pair_centric_parallelism_sufficient(
             int(total_atoms), total_cells, n_outer
         ):
             chosen = "atom_centric"
@@ -1768,9 +1733,9 @@ def cell_list(
             device,
         )
     else:
-        # Caller-provided caches are assumed to have been sized with the
-        # default public estimate policy.
-        cell_list_min_cells = 4
+        # Keep the same cell-grid policy used by the selected query strategy.
+        # Caller-provided caches may be pre-sized with this policy; changing it
+        # here would decouple ``neighbor_search_radius`` from the built grid.
         cells_per_dimension.zero_()
         atom_periodic_shifts.zero_()
         atom_to_cell_mapping.zero_()

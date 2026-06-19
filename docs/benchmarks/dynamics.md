@@ -63,29 +63,9 @@ Throughput (atom-steps/s) for single-system MD integrators.
 
 ### Batched MD
 
-Performance for batched MD simulations showing how throughput scales with both
-system size and batch size. Batching enables efficient parameter sweeps and
-ensemble simulations.
-
-#### Time Scaling
-
-```{figure} _static/dynamics_md_batch_nvalchemiops_scaling_h100.png
-:width: 90%
-:align: center
-:alt: MD batched scaling
-
-Average step time for batched MD simulations showing batch size scaling.
-```
-
-#### Throughput
-
-```{figure} _static/dynamics_md_batch_nvalchemiops_throughput_h100.png
-:width: 90%
-:align: center
-:alt: MD batched throughput
-
-Total throughput (atom-steps/s) for batched MD systems.
-```
+The current shipped benchmark artifacts do not include a batched MD CSV. The
+plot generator therefore omits batched MD figures until fresh batched MD timing
+data is added under `docs/benchmarks/benchmark_results/`.
 
 ### Available Integrators
 
@@ -354,7 +334,6 @@ potential:
 Results are saved as CSV files in `docs/benchmarks/benchmark_results/`:
 
 - `dynamics_md_single_nvalchemiops_<gpu_sku>.csv`
-- `dynamics_md_batch_nvalchemiops_<gpu_sku>.csv`
 - `dynamics_opt_single_nvalchemiops_<gpu_sku>.csv`
 - `dynamics_opt_batch_nvalchemiops_<gpu_sku>.csv`
 - `fire_compare_<gpu_sku>.csv`

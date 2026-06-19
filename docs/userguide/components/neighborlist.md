@@ -217,7 +217,7 @@ use `cell_list`.  This avoids routing large high-cutoff systems to the
 CUDA float32 fully-periodic workloads with compatible outputs and contiguous
 batch metadata.  The same estimate is exposed publicly via
 `suggest_neighbor_list_method` / `estimate_neighbor_list_costs` (see
-[](#estimating-and-running-a-strategy-explicitly)); call one once on per-system
+{ref}`estimating-and-running-a-strategy-explicitly`); call one once on per-system
 geometry (`batch_ptr`, `cell`, `pbc`, `cutoff`) and reuse the returned strategy
 name explicitly when repeated calls should avoid auto-dispatch syncs.  The
 crossover constants are env-overridable (`NVALCHEMI_NEIGHLIST_CELL_SHELL`,
@@ -323,6 +323,8 @@ method-dependent: `"naive"` returns a 2-tuple `(neighbor_list, neighbor_ptr)`
 (non-periodic, no shifts), while `"cell_list"` synthesizes a non-PBC cell and
 returns a 3-tuple `(neighbor_list, neighbor_ptr, shifts)` with zeroed shifts.
 Pass an explicit `cell`+`pbc` (or use the matrix format) for a stable 3-tuple.
+
+(estimating-and-running-a-strategy-explicitly)=
 
 ### Estimating and running a strategy explicitly
 

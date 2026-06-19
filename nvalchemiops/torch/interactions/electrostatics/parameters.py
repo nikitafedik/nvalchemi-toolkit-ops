@@ -81,8 +81,9 @@ def _count_atoms_per_system(
         )
 
     counts = torch.zeros(num_systems, dtype=torch.int32, device=batch_idx.device)
-    ones = torch.ones_like(batch_idx)
-    return counts.scatter_add_(0, batch_idx, ones)
+    index = batch_idx.to(torch.int64)
+    ones = torch.ones(batch_idx.shape, dtype=counts.dtype, device=batch_idx.device)
+    return counts.scatter_add_(0, index, ones)
 
 
 def estimate_ewald_parameters(

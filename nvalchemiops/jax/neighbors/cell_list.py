@@ -42,20 +42,19 @@ from nvalchemiops.neighbors.cell_list import (
     compute_batch_pair_centric_n_outer,
     get_build_cell_list_kernel,
     get_query_cell_list_kernel,
-    is_pair_centric_launch_safe,
     is_pair_centric_parallelism_sufficient,
     select_cell_list_strategy,
 )
 from nvalchemiops.neighbors.cell_list import (
     query_cell_list as _warp_query_cell_list,
 )
-from nvalchemiops.neighbors.cell_list.launchers import (
-    _raise_unsafe_pair_centric_launch,
-)
 from nvalchemiops.neighbors.neighbor_utils import (
     estimate_max_neighbors,
     get_gather_positions_and_shifts_kernel,
     selective_zero_num_neighbors_single,
+)
+from nvalchemiops.neighbors.neighbor_utils import (
+    fill_neighbor_matrix_tail as _warp_fill_neighbor_matrix_tail,
 )
 from nvalchemiops.neighbors.output_args import (
     _has_partial_or_pair_outputs,
@@ -78,6 +77,22 @@ _jax_construct_bin_size_f64 = jax_kernel(
     in_out_argnames=["cells_per_dimension_single"],
     enable_backward=False,
 )
+
+
+@functools.cache
+def _get_jax_construct_bin_size_kernel(wp_dtype: type, min_cells_per_dimension: int):
+    """Return the single-system bin-size kernel for a cell-count policy."""
+    return jax_kernel(
+        get_build_cell_list_kernel(
+            "construct_bin_size",
+            wp_dtype,
+            min_cells_per_dimension=int(min_cells_per_dimension),
+        ),
+        num_outputs=1,
+        in_out_argnames=["cells_per_dimension_single"],
+        enable_backward=False,
+    )
+
 
 # Build step 2: Count atoms per bin
 _jax_count_atoms_per_bin_f32 = jax_kernel(
@@ -422,6 +437,50 @@ def _validate_atom_centric_path(atom_centric_path: str) -> str:
             f"got {atom_centric_path!r}",
         )
     return atom_centric_path
+
+
+def _fill_neighbor_matrix_tail_jax(
+    neighbor_matrix: jax.Array,
+    num_neighbors: jax.Array,
+    fill_value: int,
+) -> jax.Array:
+    """Fill inactive neighbor-matrix slots from per-row counts."""
+    if int(neighbor_matrix.shape[1]) == 0:
+        return neighbor_matrix
+    (neighbor_matrix,) = _jax_fill_neighbor_matrix_tail(
+        num_neighbors,
+        neighbor_matrix,
+        int(fill_value),
+    )
+    return neighbor_matrix
+
+
+def _fill_neighbor_matrix_tail_callback(
+    num_neighbors: wp.array(dtype=wp.int32),
+    neighbor_matrix: wp.array(dtype=wp.int32, ndim=2),
+    fill_value: wp.int32,
+) -> None:
+    """jax_callable callback for the shared Warp tail-fill launcher."""
+    _warp_fill_neighbor_matrix_tail(
+        num_neighbors,
+        int(neighbor_matrix.shape[0]),
+        int(neighbor_matrix.shape[1]),
+        int(fill_value),
+        neighbor_matrix,
+        str(neighbor_matrix.device),
+    )
+
+
+_jax_fill_neighbor_matrix_tail = jax_callable(
+    _fill_neighbor_matrix_tail_callback,
+    num_outputs=1,
+    in_out_argnames=["neighbor_matrix"],
+    # The tail-fill launcher is intentionally not graph-captured.  On a clean
+    # cache, Warp may need to compile/load the tiny specialized module here; a
+    # GraphMode.WARP callback would attempt that while the CUDA stream is
+    # capturing, which fails before the first benchmark row completes.
+    graph_mode=GraphMode.NONE,
+)
 
 
 def _resolve_cell_strategy(
@@ -1576,8 +1635,10 @@ def estimate_cell_list_sizes(
     cutoff: float,
     pbc: jax.Array | None = None,
     buffer_factor: float = 1.5,
+    max_nbins: int = 524288,
+    min_cells_per_dimension: int = 4,
 ) -> tuple[int, jax.Array, jax.Array]:
-    """Estimate required cell list sizes based on atomic density.
+    """Estimate required cell list sizes from the Warp cell-grid policy.
 
     Parameters
     ----------
@@ -1590,7 +1651,13 @@ def estimate_cell_list_sizes(
     pbc : jax.Array, shape (3,) or (1, 3), dtype=bool, optional
         Periodic boundary condition flags. Default is all True.
     buffer_factor : float, optional
-        Buffer multiplier for cell count estimation. Default is 1.5.
+        Deprecated compatibility argument. The JAX estimator now mirrors the
+        Warp/Torch geometry rule and ignores this value.
+    max_nbins : int, default=524288
+        Maximum cell count allowed for a single system.
+    min_cells_per_dimension : int, default=4
+        Lower bound for the per-axis cell count. Pass 1 for explicit
+        atom-centric benchmarks.
 
     Returns
     -------
@@ -1603,9 +1670,8 @@ def estimate_cell_list_sizes(
 
     Notes
     -----
-    This function estimates cell list parameters based on atomic positions and
-    density. The actual number of cells used will be determined during cell
-    list construction.
+    This function mirrors the same per-axis cell count and search-radius rule
+    as the Warp ``estimate_sizes`` kernel used by Torch bindings.
 
     .. warning::
 
@@ -1621,60 +1687,54 @@ def estimate_cell_list_sizes(
         pbc = jnp.ones((1, 3), dtype=jnp.bool_)
     if pbc.ndim == 1:
         pbc = pbc[jnp.newaxis, :]
+    if max_nbins <= 0:
+        raise ValueError("max_nbins must be positive")
+    if cutoff <= 0 or positions.shape[0] == 0:
+        return 1, jnp.ones(3, dtype=jnp.int32), jnp.zeros(3, dtype=jnp.int32)
 
-    # Simple estimation: compute total volume and estimate cell volume
-    # Cell volume = det(cell_matrix)
-    det = jnp.linalg.det(cell[0])
-    volume = jnp.abs(det)
-    cell_volume = cutoff**3
-    # TODO: This estimation derives array sizes from traced input data (cell
-    # geometry), which is fundamentally incompatible with jax.jit compilation.
-    # The JAX bindings need a refactored usage pattern where sizing is always
-    # performed outside the JIT boundary, or a fixed upper-bound allocation
-    # strategy is adopted.
-    num_cells_est = jnp.int32(volume / cell_volume * buffer_factor)
-    max_total_cells = jnp.max(jnp.array([num_cells_est, 8]))  # Minimum 8 cells
+    total_cells, cells_per_dimension, neighbor_search_radius = (
+        _estimate_cell_grid_parameters(
+            cell[0],
+            pbc[0],
+            cutoff,
+            max_nbins=max_nbins,
+            min_cells_per_dimension=min_cells_per_dimension,
+        )
+    )
 
-    # Compute cells_per_dimension and neighbor_search_radius from cell geometry,
-    # mirroring the Warp _estimate_cell_list_sizes kernel used by the Torch
-    # path: natural cell count, ADAPTIVE_MIN_CELLS=4 promotion on PBC axes,
-    # halve-to-fit when total cells > max_total_cells, then compute
-    # neighbor_search_radius against the FINAL cells_per_dimension.
-    inverse_cell_transpose = jnp.linalg.inv(cell[0]).T
+    return int(jax.device_get(total_cells)), cells_per_dimension, neighbor_search_radius
+
+
+def _estimate_cell_grid_parameters(
+    cell: jax.Array,
+    pbc: jax.Array,
+    cutoff: float,
+    *,
+    max_nbins: int,
+    min_cells_per_dimension: int,
+) -> tuple[jax.Array, jax.Array, jax.Array]:
+    """Mirror the Warp ``estimate_sizes`` cell-grid rule in JAX."""
+    inverse_cell_transpose = jnp.linalg.inv(cell).T
     face_distances = 1.0 / jnp.linalg.norm(inverse_cell_transpose, axis=1)
     cells_per_dimension = jnp.maximum(jnp.int32(face_distances / cutoff), 1)
 
     pbc_squeezed = pbc.squeeze()[:3] if pbc.ndim > 1 else pbc[:3]
 
-    # ADAPTIVE_MIN_CELLS=4: promote each PBC axis (or any axis already > 1)
-    # up to at least 4 cells so the atom-centric query has enough cell-level
-    # parallelism.  Open axes with a single cell are left alone.
-    ADAPTIVE_MIN_CELLS = 4
-    promote_mask = pbc_squeezed | (cells_per_dimension > 1)
-    # Bit-trick: smallest power-of-2 multiplier that brings cells_per_dim
-    # to >= ADAPTIVE_MIN_CELLS.  At cells_per_dim=1 -> multiplier=4; at 2 ->
-    # 2; at >= 4 -> 1.
-    needed_mult = jnp.where(
-        cells_per_dimension >= ADAPTIVE_MIN_CELLS,
-        1,
-        ADAPTIVE_MIN_CELLS // jnp.maximum(cells_per_dimension, 1),
-    )
-    cells_per_dimension = jnp.where(
-        promote_mask,
-        cells_per_dimension * needed_mult,
-        cells_per_dimension,
-    )
+    if int(min_cells_per_dimension) > 1:
+        min_cells = jnp.int32(min_cells_per_dimension)
+        promote_mask = pbc_squeezed | (cells_per_dimension > 1)
+        for _ in range(16):
+            cells_per_dimension = jnp.where(
+                promote_mask & (cells_per_dimension < min_cells),
+                cells_per_dimension * 2,
+                cells_per_dimension,
+            )
 
-    # Halve-to-fit: if total cells exceeds max_total_cells, halve each axis
-    # (floor with min=1) repeatedly until total <= max.  Mirrors the kernel's
-    # ``while total_cells > max_cells_allowed`` loop.
     def _halve_to_fit(cpd):
         total = cpd[0] * cpd[1] * cpd[2]
-        cpd = jnp.where(total > max_total_cells, jnp.maximum(cpd // 2, 1), cpd)
+        cpd = jnp.where(total > max_nbins, jnp.maximum(cpd // 2, 1), cpd)
         return cpd
 
-    # 3 iterations is enough to halve 4*4*4=64 down to 2*2*2=8.  Cap at 16
-    # iterations to handle larger grids without unbounded growth.
     for _ in range(16):
         cells_per_dimension = _halve_to_fit(cells_per_dimension)
 
@@ -1683,8 +1743,11 @@ def estimate_cell_list_sizes(
         jnp.zeros(3, dtype=jnp.int32),
         jnp.int32(jnp.ceil(cutoff * cells_per_dimension / face_distances)),
     )
+    total_cells = (
+        cells_per_dimension[0] * cells_per_dimension[1] * cells_per_dimension[2]
+    )
 
-    return max_total_cells, cells_per_dimension, neighbor_search_radius
+    return total_cells, cells_per_dimension, neighbor_search_radius
 
 
 def _cell_list_pair_outputs_forward(
@@ -1954,6 +2017,7 @@ def build_cell_list(
     neighbor_distances: jax.Array | None = None,
     pair_energies: jax.Array | None = None,
     pair_forces: jax.Array | None = None,
+    min_cells_per_dimension: int = 4,
 ) -> tuple[
     jax.Array,
     jax.Array,
@@ -1991,6 +2055,9 @@ def build_cell_list(
         OUTPUT: Flattened list of atom indices organized by cell. If None, allocated.
     max_total_cells : int, optional
         Maximum number of cells to allocate. If None, will be estimated.
+    min_cells_per_dimension : int, default=4
+        Lower bound for the per-axis cell count. Pass 1 for explicit
+        atom-centric direct paths.
 
     Returns
     -------
@@ -2047,10 +2114,19 @@ def build_cell_list(
         cell = cell[jnp.newaxis, :, :]
     if pbc.ndim == 1:
         pbc = pbc[jnp.newaxis, :]
+    if graph_mode == "warp" and int(min_cells_per_dimension) != 4:
+        raise NotImplementedError(
+            "min_cells_per_dimension != 4 is not supported with "
+            "graph_mode='warp' in the JAX cell-list build path.",
+        )
 
     if max_total_cells is None:
         max_total_cells, _, neighbor_search_radius_est = estimate_cell_list_sizes(
-            positions, cell, cutoff, pbc
+            positions,
+            cell,
+            cutoff,
+            pbc,
+            min_cells_per_dimension=min_cells_per_dimension,
         )
         if neighbor_search_radius is None:
             neighbor_search_radius = neighbor_search_radius_est
@@ -2076,11 +2152,17 @@ def build_cell_list(
 
     # Select kernels based on dtype
     if positions.dtype == jnp.float64:
-        _construct_bin_size = _jax_construct_bin_size_f64
+        _construct_bin_size = _get_jax_construct_bin_size_kernel(
+            wp.float64,
+            int(min_cells_per_dimension),
+        )
         _count_atoms = _jax_count_atoms_per_bin_f64
         _bin_atoms = _jax_bin_atoms_f64
     else:
-        _construct_bin_size = _jax_construct_bin_size_f32
+        _construct_bin_size = _get_jax_construct_bin_size_kernel(
+            wp.float32,
+            int(min_cells_per_dimension),
+        )
         _count_atoms = _jax_count_atoms_per_bin_f32
         _bin_atoms = _jax_bin_atoms_f32
         positions = positions.astype(jnp.float32)
@@ -2367,13 +2449,17 @@ def query_cell_list(
         max_neighbors = estimate_max_neighbors(cutoff)
 
     if neighbor_matrix is None:
-        neighbor_matrix = jnp.full(
-            (positions.shape[0], max_neighbors),
-            positions.shape[0],
-            dtype=jnp.int32,
-        )
-    elif rebuild_flags is None and graph_mode == "none":
-        neighbor_matrix = neighbor_matrix.at[:].set(jnp.int32(positions.shape[0]))
+        if rebuild_flags is None:
+            neighbor_matrix = jnp.empty(
+                (positions.shape[0], max_neighbors),
+                dtype=jnp.int32,
+            )
+        else:
+            neighbor_matrix = jnp.full(
+                (positions.shape[0], max_neighbors),
+                positions.shape[0],
+                dtype=jnp.int32,
+            )
 
     if num_neighbors is None:
         num_neighbors = jnp.zeros(positions.shape[0], dtype=jnp.int32)
@@ -2381,12 +2467,16 @@ def query_cell_list(
         num_neighbors = num_neighbors.at[:].set(jnp.int32(0))
 
     if neighbor_matrix_shifts is None:
-        neighbor_matrix_shifts = jnp.zeros(
-            (positions.shape[0], max_neighbors, 3),
-            dtype=jnp.int32,
-        )
-    elif rebuild_flags is None and graph_mode == "none":
-        neighbor_matrix_shifts = neighbor_matrix_shifts.at[:].set(jnp.int32(0))
+        if rebuild_flags is None:
+            neighbor_matrix_shifts = jnp.empty(
+                (positions.shape[0], max_neighbors, 3),
+                dtype=jnp.int32,
+            )
+        else:
+            neighbor_matrix_shifts = jnp.zeros(
+                (positions.shape[0], max_neighbors, 3),
+                dtype=jnp.int32,
+            )
 
     # Select kernels based on dtype.  All paths use the same sorted-reads
     # atom-centric kernel; selective callers supply a non-trivial
@@ -2482,11 +2572,9 @@ def query_cell_list(
             # JAX cell_list is full-fill (half_fill+pair_centric raised above).
             n_outer = compute_batch_pair_centric_n_outer((Rx, Ry, Rz), False)
             total_cells = int(atoms_per_cell_count.shape[0])
-            if not is_pair_centric_launch_safe(total_cells, n_outer):
-                if strategy == "pair_centric":
-                    _raise_unsafe_pair_centric_launch(total_cells, n_outer)
-                chosen = "atom_centric"
-            elif strategy == "auto" and not is_pair_centric_parallelism_sufficient(
+            # The Warp launcher chunks oversized logical pair grids; only auto
+            # dispatch uses this performance heuristic to avoid underfilled work.
+            if strategy == "auto" and not is_pair_centric_parallelism_sufficient(
                 total_atoms, total_cells, n_outer
             ):
                 chosen = "atom_centric"
@@ -2535,6 +2623,11 @@ def query_cell_list(
             float(cutoff),
             fill_value,
             int(n_outer),
+        )
+        neighbor_matrix = _fill_neighbor_matrix_tail_jax(
+            neighbor_matrix,
+            num_neighbors,
+            int(positions.shape[0]),
         )
         return neighbor_matrix, num_neighbors, neighbor_matrix_shifts
 
@@ -2622,6 +2715,13 @@ def query_cell_list(
             empty_vec_matrix,
             rf,
             launch_dims=(total_atoms,),
+        )
+
+    if graph_mode == "none":
+        neighbor_matrix = _fill_neighbor_matrix_tail_jax(
+            neighbor_matrix,
+            num_neighbors,
+            int(positions.shape[0]),
         )
 
     return neighbor_matrix, num_neighbors, neighbor_matrix_shifts
@@ -2836,9 +2936,22 @@ def cell_list(
     ):
         max_neighbors = estimate_max_neighbors(cutoff)
 
+    chosen_for_build = _resolve_cell_strategy(
+        strategy,
+        total_atoms=int(positions.shape[0]),
+        cutoff=float(cutoff),
+        device_is_cpu=_is_cpu_array(positions),
+        half_fill=half_fill,
+    )
+    cell_list_min_cells = 1 if chosen_for_build == "atom_centric" else 4
+
     if max_total_cells is None:
         max_total_cells, _, neighbor_search_radius_est = estimate_cell_list_sizes(
-            positions, cell, cutoff, pbc
+            positions,
+            cell,
+            cutoff,
+            pbc,
+            min_cells_per_dimension=cell_list_min_cells,
         )
         if neighbor_search_radius is None:
             neighbor_search_radius = neighbor_search_radius_est
@@ -2860,19 +2973,28 @@ def cell_list(
     if cell_atom_list is None:
         cell_atom_list = jnp.zeros(positions.shape[0], dtype=jnp.int32)
     if neighbor_matrix is None:
-        neighbor_matrix = jnp.full(
-            (num_rows, max_neighbors),
-            positions.shape[0],
-            dtype=jnp.int32,
-        )
-    elif graph_mode == "none":
+        if has_pair_outputs:
+            neighbor_matrix = jnp.full(
+                (num_rows, max_neighbors),
+                positions.shape[0],
+                dtype=jnp.int32,
+            )
+        else:
+            neighbor_matrix = jnp.empty((num_rows, max_neighbors), dtype=jnp.int32)
+    elif has_pair_outputs and graph_mode == "none":
         neighbor_matrix = neighbor_matrix.at[:].set(jnp.int32(positions.shape[0]))
     if neighbor_matrix_shifts is None:
-        neighbor_matrix_shifts = jnp.zeros(
-            (num_rows, max_neighbors, 3),
-            dtype=jnp.int32,
-        )
-    elif graph_mode == "none":
+        if has_pair_outputs:
+            neighbor_matrix_shifts = jnp.zeros(
+                (num_rows, max_neighbors, 3),
+                dtype=jnp.int32,
+            )
+        else:
+            neighbor_matrix_shifts = jnp.empty(
+                (num_rows, max_neighbors, 3),
+                dtype=jnp.int32,
+            )
+    elif has_pair_outputs and graph_mode == "none":
         neighbor_matrix_shifts = neighbor_matrix_shifts.at[:].set(jnp.int32(0))
     if num_neighbors is None:
         num_neighbors = jnp.zeros(num_rows, dtype=jnp.int32)
@@ -2952,6 +3074,7 @@ def cell_list(
             cell_atom_list=cell_atom_list,
             max_total_cells=max_total_cells,
             graph_mode="none",
+            min_cells_per_dimension=cell_list_min_cells,
         )
 
         if has_pair_outputs:
@@ -3012,9 +3135,6 @@ def cell_list(
                     ) from exc
                 # JAX cell_list is full-fill (half_fill+pair_centric raised above).
                 pc_n_outer = compute_batch_pair_centric_n_outer((Rx, Ry, Rz), False)
-                total_cells = int(atoms_per_cell_count.shape[0])
-                if not is_pair_centric_launch_safe(total_cells, pc_n_outer):
-                    _raise_unsafe_pair_centric_launch(total_cells, pc_n_outer)
                 pc_strategy = "pair_centric"
 
             forward_kwargs = {
